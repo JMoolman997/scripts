@@ -1,95 +1,136 @@
 #!/bin/bash
-# sync_movies.sh - Sync new movie files from a local directory to a remote server using rsync.
+# sync_movies.sh — Fast movie sync for Jellyfin (+ external subs)
 #
-# Usage: sync_movies.sh [options]
-# Options:
-#   -u <user>       SSH username (default: moolman840)
-#   -h <host>       SSH host (e.g., 100.76.105.58)
-#   -p <port>       SSH port (default: 2222)
-#   -l <path>       Local source directory (path to local media or movies folder)
-#   -r <path>       Remote base path (default: /mnt/media)
+# Usage:
+#   ./sync_movies.sh -h <host> [-u user] [-p port] [-l local_movies_dir] [-r remote_base_dir] [-n]
 #
-# Example:
-#   ./sync_movies.sh -h 100.76.105.58 -u moolman840 -l "$HOME/Videos/Movies" -r "/mnt/media"
+# Defaults (env or flags):
+#   SSH_USER=${SSH_USER:-moolman840}
+#   SSH_HOST=${SSH_HOST:-}             # required
+#   SSH_PORT=${SSH_PORT:-2222}
+#   LOCAL_MOVIES_DIR=${LOCAL_MOVIES_DIR:-$HOME/Videos/Movies}
+#   REMOTE_BASE_PATH=${REMOTE_BASE_PATH:-/mnt/media}
+#   SYNC_PROFILE=${SYNC_PROFILE:-wan}  # wan|lan
+#   PREALLOCATE=${PREALLOCATE:-0}      # 1 to enable --preallocate
+#   COMP_LEVEL=${COMP_LEVEL:-6}        # zstd level when SYNC_PROFILE=wan
+#   DRY_RUN via -n flag
 #
-# Tip: Use 'ssh-agent' and 'ssh-add' before running this script to avoid repeated passphrase prompts:
-#   eval "$(ssh-agent -s)"
-#   ssh-add ~/.ssh/id_ed25519
+# Tip: cache your key passphrase first:
+#   eval "$(ssh-agent -s)"; ssh-add ~/.ssh/id_ed25519
 
-# Configurable variables (with defaults that can be overridden by env or args):
+set -euo pipefail
+IFS=$'\n\t'
+
+# --- logging ---------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# load your logger
+source "$SCRIPT_DIR/lib/log.sh" 2>/dev/null || true
+# adapters/fallbacks if names differ or log.sh missing
+if ! declare -F log_info >/dev/null; then
+  if declare -F info >/dev/null;   then log_info(){ info "$@"; };   else log_info(){ printf "[INFO] %s\n" "$*"; }; fi
+  if declare -F warn >/dev/null;   then log_warn(){ warn "$@"; };   else log_warn(){ printf "[WARN] %s\n" "$*"; }; fi
+  if declare -F error >/dev/null;  then log_error(){ error "$@"; }; else log_error(){ printf "[ERROR] %s\n" "$*"; }; fi
+  if declare -F success >/dev/null;then log_success(){ success "$@"; } else log_success(){ printf "[ OK ] %s\n" "$*"; }; fi
+fi
+
+# --- config ---------------------------------------------------------------
 SSH_USER="${SSH_USER:-moolman840}"
 SSH_HOST="${SSH_HOST:-}"
 SSH_PORT="${SSH_PORT:-2222}"
-LOCAL_SOURCE="${LOCAL_SOURCE:-$HOME/Videos}"
+LOCAL_MOVIES_DIR="${LOCAL_MOVIES_DIR:-$HOME/Videos/Movies}"
 REMOTE_BASE_PATH="${REMOTE_BASE_PATH:-/mnt/media}"
+SYNC_PROFILE="${SYNC_PROFILE:-wan}"   # wan|lan
+PREALLOCATE="${PREALLOCATE:-0}"
+COMP_LEVEL="${COMP_LEVEL:-6}"
+DRY_RUN=0
 
-# Parse command-line options to override defaults
-opt_l_used=0
-while getopts "u:h:p:l:r:" opt; do
+while getopts "u:h:p:l:r:n" opt; do
   case "$opt" in
     u) SSH_USER="$OPTARG" ;;
     h) SSH_HOST="$OPTARG" ;;
     p) SSH_PORT="$OPTARG" ;;
-    l) LOCAL_SOURCE="$OPTARG"; opt_l_used=1 ;;
+    l) LOCAL_MOVIES_DIR="$OPTARG" ;;
     r) REMOTE_BASE_PATH="$OPTARG" ;;
-    *) echo "Usage: $0 [-u user] [-h host] [-p port] [-l local_path] [-r remote_path]"; exit 1 ;;
+    n) DRY_RUN=1 ;;
+    *) log_error "Usage: $0 -h host [-u user] [-p port] [-l local_movies_dir] [-r remote_base_dir] [-n]"; exit 1 ;;
   esac
 done
 
-# Expand tilde to home dir if present
-if [[ "$LOCAL_SOURCE" == ~* ]]; then
-  LOCAL_SOURCE="${HOME}${LOCAL_SOURCE:1}"
-fi
+[[ "$LOCAL_MOVIES_DIR" == ~* ]] && LOCAL_MOVIES_DIR="${HOME}${LOCAL_MOVIES_DIR:1}"
+[[ -z "$SSH_HOST" ]] && { log_error "SSH host required (-h or SSH_HOST)."; exit 1; }
+[[ -d "$LOCAL_MOVIES_DIR" ]] || { log_error "Local dir '$LOCAL_MOVIES_DIR' not found."; exit 1; }
 
-# Determine the local Movies directory path
-if [ $opt_l_used -eq 1 ]; then
-  LOCAL_MOVIES_DIR="$LOCAL_SOURCE"
+REMOTE_MOVIES_DIR="${REMOTE_BASE_PATH%/}/Movies"
+
+# --- connection reuse & tuning (ARRAYS to avoid quoting bugs) -------------
+# Use a short hashed ControlPath to avoid UNIX path length limits
+CM_DIR="$HOME/.ssh/cm"
+mkdir -p "$CM_DIR"
+SOCK="$CM_DIR/%C"
+SSH_OPTS=(
+  -p "$SSH_PORT"
+  -o ControlMaster=auto
+  -o ControlPersist=300
+  -o ControlPath="$SOCK"
+  -o Ciphers=aes128-gcm@openssh.com
+)
+# Warm up a master connection (ignore failure)
+ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$SSH_USER@$SSH_HOST" true || true
+
+# rsync feature detection (best-effort)
+has_flag(){ rsync --help 2>&1 | grep -q -- "$1"; }
+
+RSYNC_BASE_OPTS=(-avh --ignore-existing --protect-args --progress --partial --partial-dir=.rsync-partial)
+if [[ "$SYNC_PROFILE" == "lan" ]]; then
+  RSYNC_TUNE_OPTS=(--no-compress --whole-file)
 else
-  LOCAL_MOVIES_DIR="${LOCAL_SOURCE%/}/Movies"
+  if has_flag 'compress-choice'; then
+    RSYNC_TUNE_OPTS=(--compress --compress-choice=zstd --compress-level="$COMP_LEVEL")
+  else
+    RSYNC_TUNE_OPTS=(--compress)
+  fi
 fi
+[[ "$PREALLOCATE" == "1" ]] && RSYNC_TUNE_OPTS+=(--preallocate)
+[[ "$DRY_RUN" == "1"    ]] && RSYNC_BASE_OPTS+=(-n)
 
-# Verify required parameters
-if [ -z "$SSH_HOST" ]; then
-  echo "Error: SSH_HOST is not specified."
-  exit 1
-fi
-if [ ! -d "$LOCAL_MOVIES_DIR" ]; then
-  echo "Error: Local directory '$LOCAL_MOVIES_DIR' does not exist."
-  exit 1
-fi
-
-# Ensure the remote Movies directory exists on the server
-ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$REMOTE_BASE_PATH/Movies'" || {
-  echo "Error: Unable to create remote directory $REMOTE_BASE_PATH/Movies"
-  exit 1
+# Build a single rsync -e command string from SSH_OPTS (avoid IFS newlines)
+build_ssh_cmd() {
+  local parts=(ssh "${SSH_OPTS[@]}")
+  # join with spaces regardless of IFS
+  printf '%s' "${parts[0]}"
+  local i
+  for (( i=1; i<${#parts[@]}; i++ )); do
+    printf ' %s' "${parts[i]}"
+  done
 }
+RSYNC_SSH=(-e "$(build_ssh_cmd)")
+RSYNC_OPTS=("${RSYNC_BASE_OPTS[@]}" "${RSYNC_TUNE_OPTS[@]}" "${RSYNC_SSH[@]}")
 
-# Find all files in the local Movies directory (relative paths)
-mapfile -t files < <(find "$LOCAL_MOVIES_DIR" -type f -printf "%P\n" | sort)
+log_info "Profile: $SYNC_PROFILE | Dry-run: $DRY_RUN | Preallocate: $PREALLOCATE"
+log_info "Local:   $LOCAL_MOVIES_DIR"
+log_info "Remote:  $SSH_USER@$SSH_HOST:$REMOTE_MOVIES_DIR"
 
-# Loop through each movie file
-for file in "${files[@]}"; do
-  filename="$(basename "$file")"
-  remote_file="$REMOTE_BASE_PATH/Movies/$filename"
+# ensure remote base exists
+ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "mkdir -p \"$REMOTE_MOVIES_DIR\""
 
-  # Properly quote remote file for test
-  ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -c "$(printf 'test -e %q' "$remote_file")"
-  rc=$?
-  if [ $rc -eq 0 ]; then
-    echo "Skipping '$filename' (already exists on remote)."
-    continue
-  elif [ $rc -ne 1 ]; then
-    echo "Error: failed to check remote file '$remote_file' (SSH error code $rc). Aborting."
-    exit 1
-  fi
+# --- single-shot rsync (videos + subs) -----------------------------------
+INCLUDES=(
+  --include='*/'
+  --include='*.mp4' --include='*.mkv' --include='*.avi' --include='*.mov' --include='*.wmv'
+  --include='*.srt' --include='*.ass' --include='*.ssa' --include='*.vtt' --include='*.sub' --include='*.idx'
+  --exclude='*'
+)
 
-  local_path="$LOCAL_MOVIES_DIR/$file"
-  echo "Syncing: $filename"
-  rsync -avh --progress --ignore-existing --protect-args -e "ssh -p $SSH_PORT" "$local_path" "$SSH_USER@$SSH_HOST:$REMOTE_BASE_PATH/Movies/"
-  if [ $? -ne 0 ]; then
-    echo "Error: rsync failed for file '$filename'."
-    exit 1
-  fi
-done
+log_info "Starting rsync..."
+if has_flag 'info=PROGRESS2'; then
+  RSYNC_OPTS+=(--info=progress2)
+fi
 
-echo "Movie sync completed."
+rsync "${RSYNC_OPTS[@]}" "${INCLUDES[@]}" -- \
+  "$LOCAL_MOVIES_DIR"/ "$SSH_USER@$SSH_HOST:$REMOTE_MOVIES_DIR"/
+
+# Optional: close the master connection cleanly
+ssh -O exit -o ControlPath="$SOCK" "$SSH_USER@$SSH_HOST" 2>/dev/null || true
+
+log_success "Movie sync complete."
+
