@@ -1,133 +1,190 @@
 #!/bin/bash
-# sync_shows.sh - Organize and sync TV show episodes from local to remote using rsync.
+# sync_shows.sh — TV show sync for Jellyfin (+ external subs)
 #
-# Usage: sync_shows.sh [options]
-# Options:
-#   -u <user>       SSH username (default: moolman840)
-#   -h <host>       SSH host (e.g., 100.76.105.58)
-#   -p <port>       SSH port (default: 2222)
-#   -l <path>       Local source directory (path to local media or shows folder)
-#   -r <path>       Remote base path (default: /mnt/media)
+# SYNOPSIS
+# ./sync_shows.sh -h <host> [-u user] [-p port] [-l local_shows_dir] [-r remote_base_dir] [-w workers] [-n]
 #
-# Examples:
-#   SSH_HOST=100.76.105.58 LOCAL_SOURCE="/home/user/Media" REMOTE_BASE_PATH="/mnt/media" ./sync_shows.sh
-#   ./sync_shows.sh -h 100.76.105.58 -u moolman840 -l "/home/user/Media/Shows" -r "/mnt/media"
+# DESCRIPTION
+# Parses common TV episode filename patterns (SxxEyy, 1x01, with basic multi-episode
+# tolerance), creates remote directories /Shows/<Show>/Season N, and transfers
+# episodes + external subtitles. Uses SSH ControlMaster, LAN/WAN rsync profiles,
+# batch mkdir, and bounded parallel transfers.
 #
-# This script scans the local "Shows" directory for episode files and uploads them to the remote server under "$REMOTE_BASE_PATH/Shows".
-# Files are organized on the remote by show name and season. For example, "Show.Name.S01E02.mkv" will be placed in "$REMOTE_BASE_PATH/Shows/Show Name/Season 1/".
-# The script recognizes common TV naming patterns (e.g., "Show.Name.S01E02", "Show Name - S1E2", "Show_Name.1x02").
-# Files with unrecognized naming formats are skipped and reported. Existing files on the remote are also skipped to avoid duplicates.
-# All operations are verbose, and each skipped or transferred file is logged.
+# OPTIONS
+# -h HOST Remote host/IP (required)
+# -u USER SSH username (default: $SSH_USER or moolman840)
+# -p PORT SSH port (default: 2222)
+# -l DIR Local shows directory (default: $HOME/Videos/Shows)
+# -r DIR Remote media base path (default: /mnt/media)
+# -w N Parallel transfers (default: 3)
+# -n Dry-run (no changes)
+#
+# ENV VARS
+# SSH_USER, SSH_HOST, SSH_PORT, LOCAL_SHOWS_DIR, REMOTE_BASE_PATH
+# SYNC_PROFILE=lan|wan (default: wan)
+# PREALLOCATE=1 COMP_LEVEL=<zstd level>
+# WORKERS (parallelism)
+# SSH_CIPHER=aes128-gcm@openssh.com | chacha20-poly1305@openssh.com
+#
+# SUBTITLES
+# Copies common external subtitles next to episodes: .srt .ass .ssa .vtt .sub .idx
+# Ensures VobSub pairs (.sub/.idx) stay together.
+#
+# EXIT CODES
+# 0 success; non-zero on failure of rsync/ssh.
 
-# Configurable variables (with defaults, override via env or flags):
+
+set -euo pipefail
+IFS=$'\n\t'
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/log.sh" 2>/dev/null || true
+source "$SCRIPT_DIR/lib/sync_common.sh"
+__sc_adapt_logging
+
 SSH_USER="${SSH_USER:-moolman840}"
-SSH_HOST="${SSH_HOST:-}"            # SSH host is required (no default).
+SSH_HOST="${SSH_HOST:-}"
 SSH_PORT="${SSH_PORT:-2222}"
-LOCAL_SOURCE="${LOCAL_SOURCE:-$HOME/Videos}"
+LOCAL_SHOWS_DIR="${LOCAL_SHOWS_DIR:-$HOME/Videos/Shows}"
 REMOTE_BASE_PATH="${REMOTE_BASE_PATH:-/mnt/media}"
+SYNC_PROFILE="${SYNC_PROFILE:-wan}"
+PREALLOCATE="${PREALLOCATE:-0}"
+COMP_LEVEL="${COMP_LEVEL:-6}"
+WORKERS="${WORKERS:-3}"
+SSH_CIPHER="${SSH_CIPHER:-aes128-gcm@openssh.com}"
+DRY_RUN=0
 
-# Parse command-line options
-opt_l_used=0
-while getopts "u:h:p:l:r:" opt; do
+while getopts "u:h:p:l:r:w:n" opt; do
   case "$opt" in
     u) SSH_USER="$OPTARG" ;;
     h) SSH_HOST="$OPTARG" ;;
     p) SSH_PORT="$OPTARG" ;;
-    l) LOCAL_SOURCE="$OPTARG"; opt_l_used=1 ;;
+    l) LOCAL_SHOWS_DIR="$OPTARG" ;;
     r) REMOTE_BASE_PATH="$OPTARG" ;;
-    *) echo "Usage: $0 [-u user] [-h host] [-p port] [-l local_path] [-r remote_path]"; exit 1 ;;
+    w) WORKERS="$OPTARG" ;;
+    n) DRY_RUN=1 ;;
+    *)
+      log_error "Usage: $0 -h host [-u user] [-p port] [-l local_shows_dir] [-r remote_base_dir] [-w workers] [-n]"
+      exit 1
+      ;;
   esac
 done
+shift $((OPTIND - 1))
 
-# Determine the local Shows directory path
-if [ $opt_l_used -eq 1 ]; then
-  LOCAL_SHOWS_DIR="$LOCAL_SOURCE"
-else
-  LOCAL_SHOWS_DIR="${LOCAL_SOURCE%/}/Shows"
+[[ "$LOCAL_SHOWS_DIR" == ~* ]] && LOCAL_SHOWS_DIR="${HOME}${LOCAL_SHOWS_DIR:1}"
+[[ -z "$SSH_HOST" ]] && { log_error "SSH host required (-h or SSH_HOST)."; exit 1; }
+[[ -d "$LOCAL_SHOWS_DIR" ]] || { log_error "Local dir '$LOCAL_SHOWS_DIR' not found."; exit 1; }
+[[ "$WORKERS" =~ ^[0-9]+$ ]] || { log_error "Workers must be numeric (got '$WORKERS')."; exit 1; }
+(( WORKERS > 0 )) || { log_error "Workers must be greater than zero."; exit 1; }
+
+REMOTE_SHOWS_DIR="${REMOTE_BASE_PATH%/}/Shows"
+SUB_EXTS=(srt ass ssa vtt sub idx)
+EXCLUDES_REGEX='(?i)(sample|trailer|extras?)'
+
+sc_build_ssh_opts "$SSH_PORT" "$SSH_CIPHER"
+sc_build_rsync_opts "$SYNC_PROFILE" "$COMP_LEVEL" "$PREALLOCATE" "$DRY_RUN"
+sc_ensure_mux
+
+log_info "Profile: $SYNC_PROFILE | Workers: $WORKERS | Dry-run: $DRY_RUN | Preallocate: $PREALLOCATE"
+log_info "Local:  $LOCAL_SHOWS_DIR"
+log_info "Remote: $SSH_USER@$SSH_HOST:$REMOTE_SHOWS_DIR"
+
+mapfile -t videos < <(
+  find "$LOCAL_SHOWS_DIR" -type f \
+    \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.wmv" \) |
+    sort
+)
+
+if [[ ${#videos[@]} -eq 0 ]]; then
+  log_warn "No TV episode files found in $LOCAL_SHOWS_DIR"
 fi
 
-# Verify required parameters
-if [ -z "$SSH_HOST" ]; then
-  echo "Error: SSH_HOST is not specified."
-  exit 1
-fi
-if [ ! -d "$LOCAL_SHOWS_DIR" ]; then
-  echo "Error: Local directory '$LOCAL_SHOWS_DIR' does not exist."
-  exit 1
-fi
+declare -A DIRS_SET=()
+queue=() # entries: SRC|DEST_DIR
+parse_ok=0
+parse_skip=0
 
-# Ensure the remote Shows base directory exists
-ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$REMOTE_BASE_PATH/Shows'" || {
-  echo "Error: Unable to create remote directory $REMOTE_BASE_PATH/Shows"
-  exit 1
-}
+for vid in "${videos[@]}"; do
+  fname="$(basename "$vid")"
+  rel="${vid#$LOCAL_SHOWS_DIR/}"
 
-# Find all files in the local Shows directory (recursively), and sort them
-mapfile -t files < <(find "$LOCAL_SHOWS_DIR" -type f -printf "%P\n" | sort)
+  if [[ "$fname" =~ $EXCLUDES_REGEX ]]; then
+    log_warn "Skip junk: $rel"
+    ((parse_skip++))
+    continue
+  fi
 
-# Use an associative array to track which remote directories have been created (to avoid redundant mkdir calls)
-declare -A CREATED_DIRS
+  show_raw=""
+  season=""
+  ep=""
 
-# Loop through each show file
-for file in "${files[@]}"; do
-  filename="$(basename "$file")"
-  # Parse show name, season, and episode from the filename using regex
-  season_num="" episode_num="" showname_raw=""
-  if [[ "$filename" =~ ^(.+?)[-._[:space:]]+[Ss]([0-9]+)[-._[:space:]]*[Ee]([0-9]+) ]]; then
-    # Matches patterns like "Show.Name.S01E02" or "Show Name - S1E2"
-    showname_raw="${BASH_REMATCH[1]}"
-    season_num="${BASH_REMATCH[2]}"
-    episode_num="${BASH_REMATCH[3]}"
-  elif [[ "$filename" =~ ^(.+?)[-._[:space:]]+([0-9]+)[xX]([0-9]+) ]]; then
-    # Matches patterns like "Show_Name.1x02"
-    showname_raw="${BASH_REMATCH[1]}"
-    season_num="${BASH_REMATCH[2]}"
-    episode_num="${BASH_REMATCH[3]}"
+  if [[ "$fname" =~ ^(.+?)[._[:space:]-]+[sS]([0-9]+)[._[:space:]-]*[eE]([0-9]+)([eE][0-9]+)* ]]; then
+    show_raw="${BASH_REMATCH[1]}"
+    season="${BASH_REMATCH[2]}"
+    ep="${BASH_REMATCH[3]}"
+  elif [[ "$fname" =~ ^(.+?)[._[:space:]-]+([0-9]+)[xX]([0-9]+)(-[0-9]+)? ]]; then
+    show_raw="${BASH_REMATCH[1]}"
+    season="${BASH_REMATCH[2]}"
+    ep="${BASH_REMATCH[3]}"
   else
-    echo "Skipping '$filename' (unrecognized format)."
+    log_warn "Skip (unrecognized pattern): $rel"
+    ((parse_skip++))
     continue
   fi
 
-  # Clean up the show name: replace dots, underscores, and hyphens with spaces
-  showname="${showname_raw//./ }"
-  showname="${showname//_/ }"
-  showname="${showname//-/ }"
-  # Trim any extra spaces
-  showname="$(echo "$showname" | sed -e 's/  */ /g' -e 's/^ *//; s/ *$//')"
+  show_clean="$(echo "$show_raw" | tr '._-' ' ' | sed -E 's/ +/ /g; s/^ +| +$//g')"
+  season_num=$((10#$season))
+  dest_dir="$REMOTE_SHOWS_DIR/$show_clean/Season $season_num"
+  DIRS_SET["$dest_dir"]=1
+  queue+=("$vid|$dest_dir")
 
-  # Convert season number to an integer (remove any leading zeros)
-  season=$((10#$season_num))
-  # Define the remote directory for this show's season
-  remote_dir="$REMOTE_BASE_PATH/Shows/$showname/Season $season"
+  base_noext="${vid%.*}"
+  for ext in "${SUB_EXTS[@]}"; do
+    for sub in "$base_noext".$ext*; do
+      [[ -f "$sub" ]] || continue
+      queue+=("$sub|$dest_dir")
+      case "$sub" in
+        *.idx)
+          twin="${sub%.idx}.sub"
+          [[ -f "$twin" ]] && queue+=("$twin|$dest_dir")
+          ;;
+        *.sub)
+          twin="${sub%.sub}.idx"
+          [[ -f "$twin" ]] && queue+=("$twin|$dest_dir")
+          ;;
+      esac
+    done
+  done
 
-  # Create the remote show/season directory if not already created in this run
-  if [ -z "${CREATED_DIRS["$showname Season $season"]}" ]; then
-    ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$remote_dir'" || {
-      echo "Error: failed to create remote directory '$remote_dir'."
-      exit 1
-    }
-    CREATED_DIRS["$showname Season $season"]=1
-  fi
-
-  # Check if the file already exists on the remote server
-  remote_file="$remote_dir/$filename"
-  ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" bash -c "$(printf 'test -e %q' "$remote_file")"
-  rc=$?
-  if [ $rc -eq 0 ]; then
-    echo "Skipping '$filename' (already exists on remote)."
-    continue
-  elif [ $rc -ne 1 ]; then
-    echo "Error: failed to check remote file '$remote_file' (SSH error code $rc). Aborting."
-    exit 1
-  fi
-
-  # File does not exist remotely, proceed to transfer it
-  local_path="$LOCAL_SHOWS_DIR/$file"
-  rsync -avh --progress --ignore-existing --protect-args -e "ssh -p $SSH_PORT" "$local_path" "$SSH_USER@$SSH_HOST:$remote_dir/"
-  if [ $? -ne 0 ]; then
-    echo "Error: rsync failed for file '$filename'. Aborting sync."
-    exit 1
-  fi
+  ((parse_ok++))
 done
 
-echo "Show sync completed."
+log_info "Parsed: $parse_ok episodes | Skipped: $parse_skip"
+
+if [[ ${#DIRS_SET[@]} -gt 0 ]]; then
+  sc_batch_mkdir "${!DIRS_SET[@]}"
+fi
+
+sem() {
+  while (( $(jobs -rp | wc -l) >= WORKERS )); do
+    wait -n || true
+  done
+  "$@" &
+}
+
+transfer_one() {
+  local src="$1"
+  local dst="$2"
+  sc_rsync_copy "$src" "$dst" || log_warn "rsync failed: $(basename "$src") -> $dst"
+}
+
+log_info "Transferring ${#queue[@]} items with $WORKERS workers..."
+for item in "${queue[@]}"; do
+  src="${item%%|*}"
+  dst="${item#*|}"
+  sem transfer_one "$src" "$dst"
+done
+wait || true
+
+sc_close_mux
+log_success "Show sync complete."
