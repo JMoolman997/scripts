@@ -72,12 +72,31 @@ SSH_OPTS=(
   -o ControlMaster=auto
   -o ControlPersist=300
   -o ControlPath="$SOCK"
-  -o Ciphers=aes128-gcm@openssh.com
+  -o ConnectTimeout=10
+  -o ServerAliveInterval=30
+  -o ServerAliveCountMax=3
+  -o Ciphers=${SSH_CIPHER:-aes128-gcm@openssh.com}
 )
-# Warm up a master connection (ignore failure)
-ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$SSH_USER@$SSH_HOST" true || true
+
+# --- stale mux socket guard + warmup ---------------------------------------
+ensure_mux() {
+  # If a valid master is up, reuse it
+  if ssh "${SSH_OPTS[@]}" -O check "$SSH_USER@$SSH_HOST" >/dev/null 2>&1; then
+    log_info "SSH mux: reusing existing master connection"
+    return
+  fi
+  # Try to clean any half-broken socket
+  ssh -O exit -o ControlPath="$SOCK" "$SSH_USER@$SSH_HOST" >/dev/null 2>&1 || true
+  # Prune very old orphan sockets
+  find "$CM_DIR" -maxdepth 1 -type s -mmin +120 -delete 2>/dev/null || true
+  log_warn "SSH mux: starting a fresh master connection"
+  ssh "${SSH_OPTS[@]}" -o BatchMode=yes "$SSH_USER@$SSH_HOST" true >/dev/null 2>&1 || true
+}
+ensure_mux
 
 # rsync feature detection (best-effort)
+has_flag(){ rsync --help 2>&1 | grep -q -- "$1"; }
+
 has_flag(){ rsync --help 2>&1 | grep -q -- "$1"; }
 
 RSYNC_BASE_OPTS=(-avh --ignore-existing --protect-args --progress --partial --partial-dir=.rsync-partial)
