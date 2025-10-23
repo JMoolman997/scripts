@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: bats [FILE|DIRECTORY ...]
+Run Bats-style test files without requiring a system installation.
+USAGE
+}
+
+if (( $# == 0 )); then
+  usage >&2
+  exit 1
+fi
+
+resolve_path() {
+  local target="$1"
+  if [[ "$target" == /* ]]; then
+    printf '%s\n' "$target"
+  else
+    local dir part
+    part="${target%/*}"
+    if [[ $part == "$target" ]]; then
+      dir=$(pwd)
+    else
+      dir=$(cd "$part" 2>/dev/null && pwd)
+    fi
+    if [[ -z $dir ]]; then
+      dir=$(pwd)
+    fi
+    printf '%s/%s\n' "$dir" "${target##*/}"
+  fi
+}
+
+declare -a files=()
+
+gather_files() {
+  local path
+  for path in "$@"; do
+    if [[ -d $path ]]; then
+      while IFS= read -r -d '' file; do
+        files+=("$file")
+      done < <(find "$path" -type f -name '*.bats' -print0 | sort -z)
+    else
+      files+=("$path")
+    fi
+  done
+}
+
+run_file() {
+  local file="$1"
+  if [[ ! -f $file ]]; then
+    printf 'bats: %s: No such file\n' "$file" >&2
+    return 1
+  fi
+
+  local abs_file
+  abs_file=$(resolve_path "$file")
+  local dir
+  dir=$(dirname "$abs_file")
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  local generated="$tmpdir/compiled.bash"
+
+  local abs_escaped dir_escaped
+  abs_escaped=$(printf '%q' "$abs_file")
+  dir_escaped=$(printf '%q' "$dir")
+
+  cat <<'SH' > "$generated"
+#!/usr/bin/env bash
+set -u
+set -o pipefail
+
+declare -a lines=()
+status=0
+output=''
+SH
+
+  printf 'BATS_TEST_FILENAME=%s\n' "$abs_escaped" >> "$generated"
+  printf 'BATS_TEST_DIRNAME=%s\n' "$dir_escaped" >> "$generated"
+
+  cat <<'SH' >> "$generated"
+bats__file_tmp_root=$(mktemp -d)
+trap 'rm -rf "${bats__file_tmp_root}"' EXIT
+
+run() {
+  output=''
+  lines=()
+  if (( $# == 0 )); then
+    status=0
+    return 0
+  fi
+  local tmpfile
+  tmpfile=$(mktemp)
+  "$@" >"$tmpfile" 2>&1
+  status=$?
+  output=$(<"$tmpfile")
+  rm -f "$tmpfile"
+  IFS=$'\n' read -r -d '' -a lines <<<"$output"$'\0'
+  return 0
+}
+
+load() {
+  local path="$1"
+  if [[ -z $path ]]; then
+    return 0
+  fi
+  if [[ $path != /* ]]; then
+    if [[ -f "$BATS_TEST_DIRNAME/$path" ]]; then
+      source "$BATS_TEST_DIRNAME/$path"
+      return $?
+    elif [[ -f "$BATS_TEST_DIRNAME/$path.bash" ]]; then
+      source "$BATS_TEST_DIRNAME/$path.bash"
+      return $?
+    elif [[ -f "$BATS_TEST_DIRNAME/$path.bats" ]]; then
+      source "$BATS_TEST_DIRNAME/$path.bats"
+      return $?
+    fi
+  fi
+  source "$path"
+}
+
+skip() {
+  BATS_SKIP_REASON="$1"
+  return 1
+}
+
+fail() {
+  local msg="$1"
+  printf '%s\n' "$msg" >&2
+  return 1
+}
+
+bats__main() {
+  local total=${#bats__tests[@]}
+  local failures=0
+  local i
+  if declare -f setup_file >/dev/null; then
+    BATS_TEST_NAME=setup_file
+    BATS_TEST_DESCRIPTION='setup_file'
+    BATS_TEST_NUMBER=0
+    BATS_TEST_TMPDIR="$bats__file_tmp_root/file"
+    rm -rf "$BATS_TEST_TMPDIR"
+    mkdir -p "$BATS_TEST_TMPDIR"
+    local setup_log="$BATS_TEST_TMPDIR/setup_file.log"
+    if ! setup_file >"$setup_log" 2>&1; then
+      printf ' ✗ setup_file failed\n'
+      sed 's/^/   /' "$setup_log"
+      return 1
+    fi
+  fi
+  for (( i=0; i<total; i++ )); do
+    local func="${bats__tests[i]}"
+    local desc="${bats__descriptions[i]}"
+    BATS_TEST_NAME="$func"
+    BATS_TEST_DESCRIPTION="$desc"
+    BATS_TEST_NUMBER=$((i + 1))
+    BATS_TEST_TMPDIR="$bats__file_tmp_root/$BATS_TEST_NUMBER"
+    rm -rf "$BATS_TEST_TMPDIR"
+    mkdir -p "$BATS_TEST_TMPDIR"
+    status=0
+    output=''
+    lines=()
+    local log_file="$BATS_TEST_TMPDIR/test.log"
+    : >"$log_file"
+    local test_status=0
+    if declare -f setup >/dev/null; then
+      if ! setup >>"$log_file" 2>&1; then
+        test_status=$?
+      fi
+    fi
+    if (( test_status == 0 )); then
+      if ! "$func" >>"$log_file" 2>&1; then
+        test_status=$?
+      fi
+    fi
+    if declare -f teardown >/dev/null; then
+      if ! teardown >>"$log_file" 2>&1; then
+        test_status=1
+      fi
+    fi
+    local test_output
+    test_output=$(<"$log_file")
+    if (( test_status == 0 )); then
+      printf ' ✓ %s\n' "$desc"
+    else
+      printf ' ✗ %s\n' "$desc"
+      if [[ -n $test_output ]]; then
+        printf '%s\n' "$test_output" | sed 's/^/   /'
+      fi
+      failures=$((failures + 1))
+    fi
+  done
+  if (( failures > 0 )); then
+    printf '%d tests, %d failures\n' "$total" "$failures"
+    return 1
+  else
+    printf '%d tests, 0 failures\n' "$total"
+    return 0
+  fi
+}
+SH
+
+  python3 - "$file" >> "$generated" <<'PY'
+import shlex
+import sys
+from pathlib import Path
+
+def quote(value: str) -> str:
+    if value == "":
+        return "''"
+    return shlex.quote(value)
+
+source = Path(sys.argv[1])
+lines = source.read_text().splitlines()
+tests = []
+converted = []
+pattern = '@test '
+idx = 0
+for raw_line in lines:
+    line = raw_line
+    if line.startswith('#!/'):
+        continue
+    stripped = line.lstrip()
+    if stripped.startswith(pattern):
+        head, _, remainder = stripped.partition('{')
+        prefix = line[:len(line) - len(stripped)]
+        parts = head[len(pattern):].strip()
+        if parts.startswith('"') and parts.endswith('"'):
+            desc = parts[1:-1]
+        elif parts.startswith("'") and parts.endswith("'"):
+            desc = parts[1:-1]
+        else:
+            desc = parts
+        func_name = f'bats_test_{idx}'
+        tests.append((func_name, desc))
+        converted.append(f"{prefix}function {func_name}() {{")
+        converted.append(f"{prefix}  BATS_TEST_DESCRIPTION={quote(desc)}")
+        if remainder.strip():
+            converted.append(f"{prefix}  {remainder.strip()}")
+        idx += 1
+    else:
+        converted.append(line)
+
+print('\n'.join(converted))
+print()
+print('bats__tests=(')
+for name, _ in tests:
+    print(f'  {name}')
+print(')')
+print()
+print('bats__descriptions=(')
+for _, desc in tests:
+    print(f'  {quote(desc)}')
+print(')')
+PY
+
+  cat <<'SH' >> "$generated"
+
+bats__main "$@"
+SH
+
+  local rc=0
+  if ! bash "$generated"; then
+    rc=$?
+  fi
+  rm -rf "$tmpdir"
+  return $rc
+}
+
+gather_files "$@"
+
+if (( ${#files[@]} == 0 )); then
+  printf 'bats: no test files found\n' >&2
+  exit 1
+fi
+
+rc=0
+for file in "${files[@]}"; do
+  if ! run_file "$file"; then
+    rc=1
+  fi
+
+done
+
+exit $rc
