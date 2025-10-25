@@ -7,7 +7,8 @@
 # DESCRIPTION
 # One-shot rsync that syncs movie files and common external subtitles to
 # a remote Jellyfin library path over SSH. Uses ControlMaster multiplexing,
-# LAN/WAN profiles, and safe remote shell construction to reduce overhead.
+# LAN/WAN profiles, safe remote shell construction, and pre-creates the
+# destination Movies directory to ensure rsync never fails on missing parents.
 #
 # OPTIONS
 # -h HOST Remote host/IP (required)
@@ -82,6 +83,8 @@ log_info "Remote: $SSH_USER@$SSH_HOST:$REMOTE_MOVIES_DIR"
 
 ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "mkdir -p \"$REMOTE_MOVIES_DIR\""
 
+# Only include media + subtitle extensions while allowing rsync to traverse
+# directory trees. Everything else is excluded.
 INCLUDES=(
   --include='*/'
   --include='*.mp4' --include='*.mkv' --include='*.avi' --include='*.mov' --include='*.wmv'

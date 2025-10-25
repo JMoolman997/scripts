@@ -9,6 +9,8 @@
 # tolerance), creates remote directories /Shows/<Show>/Season N, and transfers
 # episodes + external subtitles. Uses SSH ControlMaster, LAN/WAN rsync profiles,
 # batch mkdir, and bounded parallel transfers.
+# Show names are normalized (year inference + optional aliases in
+# lib/show_aliases.conf) to avoid splintered directories.
 #
 # OPTIONS
 # -h HOST Remote host/IP (required)
@@ -50,9 +52,53 @@ REMOTE_BASE_PATH="${REMOTE_BASE_PATH:-/mnt/media}"
 SYNC_PROFILE="${SYNC_PROFILE:-wan}"
 PREALLOCATE="${PREALLOCATE:-0}"
 COMP_LEVEL="${COMP_LEVEL:-6}"
-WORKERS="${WORKERS:-3}"
+WORKERS="${WORKERS:-1}"
 SSH_CIPHER="${SSH_CIPHER:-aes128-gcm@openssh.com}"
 DRY_RUN=0
+
+# --- junk filter (case-insensitive, bash-safe) ----------------------------
+# Bash [[ =~ ]] does not support (?i). Use lowercase normalization instead.
+# Matches filenames containing: sample, trailer, extra/extras
+is_junk() {
+  local s="${1,,}"   # bash 4+: to-lowercase
+  [[ "$s" =~ (sample|trailer|extras?) ]]
+}
+
+# normalize_show_name applies optional alias overrides and synthesizes a year
+# suffix when the filename carries a 4-digit year elsewhere. This keeps series
+# names consistent even when source files use mixed naming conventions.
+normalize_show_name() {
+  local name="$1"
+  local fname="$2"
+  local normalized="$name"
+  local alias_file="${SHOW_ALIASES_FILE:-$SCRIPT_DIR/lib/show_aliases.conf}"
+
+  if [[ -f "$alias_file" ]]; then
+    while IFS= read -r line; do
+      line="${line%%#*}"
+      line="${line%"${line##*[![:space:]]}"}"
+      line="${line#"${line%%[![:space:]]*}"}"
+      [[ -z "$line" ]] && continue
+      local lhs="${line%%=*}"
+      local rhs="${line#*=}"
+      lhs="$(echo "$lhs" | sed -E 's/^ +| +$//g')"
+      rhs="$(echo "$rhs" | sed -E 's/^ +| +$//g')"
+      if [[ "$lhs" == "$normalized" ]]; then
+        normalized="$rhs"
+        break
+      fi
+    done <"$alias_file"
+  fi
+
+  if [[ ! "$normalized" =~ \([0-9]{4}\)$ ]]; then
+    if [[ "$fname" =~ [\[\(]?([12][0-9]{3})[\]\)]?([[:space:][:punct:]]|$) ]]; then
+      local year="${BASH_REMATCH[1]}"
+      normalized="$normalized ($year)"
+    fi
+  fi
+
+  printf '%s\n' "$normalized"
+}
 
 while getopts "u:h:p:l:r:w:n" opt; do
   case "$opt" in
@@ -89,18 +135,54 @@ log_info "Profile: $SYNC_PROFILE | Workers: $WORKERS | Dry-run: $DRY_RUN | Preal
 log_info "Local:  $LOCAL_SHOWS_DIR"
 log_info "Remote: $SSH_USER@$SSH_HOST:$REMOTE_SHOWS_DIR"
 
-mapfile -t videos < <(
-  find "$LOCAL_SHOWS_DIR" -type f \
-    \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.wmv" \) |
-    sort
-)
+find_errors="$(mktemp)"
+videos_manifest="$(mktemp)"
+sort_manifest="${videos_manifest}.sorted"
+dirs_manifest="$(mktemp)"
+dirs_sorted="${dirs_manifest}.sorted"
+# Temporary manifests capture candidate videos and destination directories; the
+# trap ensures we always clean them up on exit.
+trap 'rm -f "$find_errors" "$videos_manifest" "$sort_manifest" "$dirs_manifest" "$dirs_sorted"' EXIT
+
+# Allow find to encounter unreadable directories without aborting the script.
+set +e
+find "$LOCAL_SHOWS_DIR" -type f \
+  \( -iname "*.mp4" -o -iname "*.mkv" -o -iname "*.avi" -o -iname "*.mov" -o -iname "*.wmv" \) \
+  >"$videos_manifest" 2>"$find_errors"
+find_status=$?
+set -e
+
+set +e
+sort "$videos_manifest" >"$sort_manifest"
+sort_status=$?
+set -e
+if (( sort_status == 0 )); then
+  mv "$sort_manifest" "$videos_manifest"
+else
+  log_warn "Sort command failed (exit $sort_status); continuing unsorted."
+  rm -f "$sort_manifest"
+fi
+
+mapfile -t videos <"$videos_manifest"
+
+if [[ -s "$find_errors" ]]; then
+  while IFS= read -r err_line; do
+    log_warn "find: $err_line"
+  done <"$find_errors"
+fi
+rm -f "$find_errors"
+
+if (( find_status != 0 )); then
+  log_warn "Continuing despite find errors (exit $find_status)."
+fi
 
 if [[ ${#videos[@]} -eq 0 ]]; then
   log_warn "No TV episode files found in $LOCAL_SHOWS_DIR"
+else
+  log_info "Discovered ${#videos[@]} candidate video files"
 fi
 
-declare -A DIRS_SET=()
-queue=() # entries: SRC|DEST_DIR
+queue=() # entries stored as SRC|DEST_DIR for lightweight tuple handling
 parse_ok=0
 parse_skip=0
 
@@ -108,11 +190,12 @@ for vid in "${videos[@]}"; do
   fname="$(basename "$vid")"
   rel="${vid#$LOCAL_SHOWS_DIR/}"
 
-  if [[ "$fname" =~ $EXCLUDES_REGEX ]]; then
+  if is_junk "$fname"; then
     log_warn "Skip junk: $rel"
-    ((parse_skip++))
+    ((++parse_skip))
     continue
-  fi
+fi
+
 
   show_raw=""
   season=""
@@ -128,14 +211,15 @@ for vid in "${videos[@]}"; do
     ep="${BASH_REMATCH[3]}"
   else
     log_warn "Skip (unrecognized pattern): $rel"
-    ((parse_skip++))
+    ((++parse_skip))
     continue
   fi
 
   show_clean="$(echo "$show_raw" | tr '._-' ' ' | sed -E 's/ +/ /g; s/^ +| +$//g')"
+  show_clean="$(normalize_show_name "$show_clean" "$fname")"
   season_num=$((10#$season))
   dest_dir="$REMOTE_SHOWS_DIR/$show_clean/Season $season_num"
-  DIRS_SET["$dest_dir"]=1
+  printf '%s\n' "$dest_dir" >>"$dirs_manifest"
   queue+=("$vid|$dest_dir")
 
   base_noext="${vid%.*}"
@@ -156,15 +240,19 @@ for vid in "${videos[@]}"; do
     done
   done
 
-  ((parse_ok++))
+  ((++parse_ok))
 done
 
 log_info "Parsed: $parse_ok episodes | Skipped: $parse_skip"
 
-if [[ ${#DIRS_SET[@]} -gt 0 ]]; then
-  sc_batch_mkdir "${!DIRS_SET[@]}"
+if [[ -s "$dirs_manifest" ]]; then
+  sort -u "$dirs_manifest" >"$dirs_sorted"
+  mapfile -t dir_list <"$dirs_sorted"
+  sc_batch_mkdir "${dir_list[@]}"
 fi
 
+# Named semaphore helper keeps a max of WORKERS parallel rsync processes without
+# requiring external tools.
 sem() {
   while (( $(jobs -rp | wc -l) >= WORKERS )); do
     wait -n || true

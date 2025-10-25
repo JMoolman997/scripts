@@ -154,11 +154,19 @@ sc_rsync_copy() { # usage: sc_rsync_copy SRC DST_DIR
 sc_batch_mkdir() { # usage: sc_batch_mkdir DIR1 DIR2 ...
   [[ $# -eq 0 ]] && return 0
 
+  # SSH into the remote host and create each directory atomically. Using a
+  # NUL-delimited read loop avoids issues with spaces or parentheses in show
+  # names and guarantees mkdir runs even when ControlMaster is active.
   {
     for dir in "$@"; do
       printf '%s\0' "$dir"
     done
-  } | ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" "xargs -0 -I% mkdir -p '%'"
+  } | ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" '
+        set -e
+        while IFS= read -r -d "" dir; do
+          mkdir -p -- "$dir"
+        done
+      ' || log_warn "Remote mkdir batch failed; continuing."
 }
 
 # --- diagnostics ----------------------------------------------------------
