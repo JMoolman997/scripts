@@ -1,4 +1,8 @@
-# Package manager wrappers
+# lib/pkg_utils.sh — thin wrappers around common package managers
+#
+# Each helper intentionally keeps logic minimal so that scripts can compose
+# additional flags as needed.  Commands are exported to simplify re-use in
+# subshells executed via `bash -c`.
 
 install_with_brew()   { brew install "$@"; }
 install_with_apt()    { sudo apt update && sudo apt install -y "$@"; }
