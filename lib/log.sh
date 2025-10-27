@@ -58,6 +58,35 @@ else
 
   COLOR_RESET='\033[0m'
 fi
+
+# baseline style sequences (override with terminfo when available)
+STYLE_BOLD='\033[1m'
+STYLE_DIM='\033[2m'
+STYLE_ITALIC='\033[3m'
+STYLE_UNDERLINE='\033[4m'
+STYLE_BLINK='\033[5m'
+STYLE_REVERSE='\033[7m'
+STYLE_CONCEAL='\033[8m'
+
+if command -v tput >/dev/null 2>&1; then
+  __log_set_style_cap() {
+    local var="$1" cap="$2"
+    local seq
+    if seq="$(tput "$cap" 2>/dev/null)"; then
+      printf -v "$var" '%s' "$seq"
+    fi
+  }
+  __log_set_style_cap STYLE_BOLD bold
+  __log_set_style_cap STYLE_DIM dim
+  __log_set_style_cap STYLE_ITALIC sitm
+  __log_set_style_cap STYLE_UNDERLINE smul
+  __log_set_style_cap STYLE_BLINK blink
+  __log_set_style_cap STYLE_REVERSE rev
+  __log_set_style_cap STYLE_CONCEAL invis
+  unset -f __log_set_style_cap
+fi
+
+STYLE_RESET="$COLOR_RESET"
 unset -v __LOG_TPUT_COLORS || true
 
 __log_getvar() {
@@ -114,8 +143,13 @@ custom_log() {
     bg_seq="$(__log_getvar "$1")"
     shift
   fi
+  local style_seq=""
+  while [[ -n "${1:-}" && $1 == STYLE_* ]]; do
+    style_seq+="$(__log_getvar "$1")"
+    shift
+  done
 
-  local full_seq="${fg_seq}${bg_seq}"
+  local full_seq="${fg_seq}${bg_seq}${style_seq}"
   log 2 "$label" "$full_seq" "$*"
 }
 
@@ -126,23 +160,31 @@ log_with_bg() {
   local fg_var="${3:?fg var missing}"
   local bg_var="${4:?bg var missing}"
   shift 4
-  local fg_seq bg_seq
+  local fg_seq bg_seq style_seq=""
   fg_seq="$(__log_getvar "$fg_var")"
   bg_seq="$(__log_getvar "$bg_var")"
-  local full_seq="${fg_seq}${bg_seq}"
+  while [[ -n "${1:-}" && $1 == STYLE_* ]]; do
+    style_seq+="$(__log_getvar "$1")"
+    shift
+  done
+  local full_seq="${fg_seq}${bg_seq}${style_seq}"
   log "$level" "$label" "$full_seq" "$*"
 }
 
 # color_print FG_VAR [BG_VAR] <text…>
 color_print() {
   local fg_var="${1:?fg var missing}"; shift
-  local fg_seq bg_seq=""
+  local fg_seq bg_seq="" style_seq=""
   fg_seq="$(__log_getvar "$fg_var")"
   if [[ -n "${1:-}" && $1 == BG_* ]]; then
     bg_seq="$(__log_getvar "$1")"
     shift
   fi
-  printf '%b%s%b\n' "${fg_seq}${bg_seq}" "$*" "$COLOR_RESET"
+  while [[ -n "${1:-}" && $1 == STYLE_* ]]; do
+    style_seq+="$(__log_getvar "$1")"
+    shift
+  done
+  printf '%b%s%b\n' "${fg_seq}${bg_seq}${style_seq}" "$*" "$COLOR_RESET"
 }
 
 # print_palette shows each named colour (foreground and background)

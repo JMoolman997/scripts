@@ -90,6 +90,19 @@ setup() {
   [[ "$clean" =~ \[ALERT\]\ danger\ zone ]]
 }
 
+@test "custom_log(): consumes style tokens" {
+  run bash -c '
+    project_root="$BATS_TEST_DIRNAME/.."
+    . "$project_root/lib/log.sh"
+    LOG_LEVEL=2
+    custom_log NOTICE COLOR_WHITE STYLE_BOLD "styled" 2>&1
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" != *STYLE_BOLD* ]]
+  clean="$(echo "$output" | strip_colors)"
+  [[ "$clean" =~ \[NOTICE\]\ styled ]]
+}
+
 @test "color_print(): prints text in fg color only" {
   run bash -c 'color_print COLOR_CYAN "just cyan"'
   [ "$status" -eq 0 ]
@@ -102,6 +115,18 @@ setup() {
   [ "$status" -eq 0 ]
   clean="$(echo "$output" | strip_colors)"
   [ "$clean" = "blk on yel" ]
+}
+
+@test "color_print(): consumes style tokens" {
+  run bash -c '
+    project_root="$BATS_TEST_DIRNAME/.."
+    . "$project_root/lib/log.sh"
+    color_print COLOR_GREEN STYLE_UNDERLINE "styled"
+  '
+  [ "$status" -eq 0 ]
+  [[ "$output" != *STYLE_UNDERLINE* ]]
+  clean="$(echo "$output" | strip_colors)"
+  [ "$clean" = "styled" ]
 }
 
 @test "color_print: prints each COLOR_* variable colour" {
