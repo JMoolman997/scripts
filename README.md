@@ -26,13 +26,34 @@ source lib/download.sh
 
 ## Tests
 
-The repo bundles Bats so you can run the suite with:
+```bash
+source "$(pwd)/lib/download.sh"
+download_file "https://example.com/tool.tar.gz"
+```
+
+### Top-level helpers
+
+- `netctl.sh` — drives common SSH and Tailscale workflows for a remote host.
+  The helper can generate/copy SSH keys, validate a login, and toggle
+  `tailscale up/down` with optional SSH support.
+- `c_setup.sh` — scaffolds a minimal C project by creating `src/`, `tests/`, and
+  `build/` directories, generating a starter Makefile, and optionally
+  initialising a git repository.
+
+## Testing
+
+All automated tests are implemented with [Bats](https://bats-core.readthedocs.io/).
+The repository includes a vendored runner so you only need Bash and standard Unix
+utilities. To execute the full suite run:
 
 ```bash
 bin/bats tests/*.bats
 ```
 
-Run a single file the same way if you are working on one area:
+Some environments also support `bin/bats tests`, but invoking the globbed test
+files explicitly guarantees every suite is executed.
+
+You can also target an individual file during development:
 
 ```bash
 bin/bats tests/netctl.bats
