@@ -1,49 +1,81 @@
 #!/usr/bin/env bash
+# netctl.sh — SSH and Tailscale convenience wrapper for remote hosts
+#
+# SYNOPSIS
+#   ./netctl.sh COMMAND [options]
+#
+# DESCRIPTION
+#   Provides a thin wrapper around common remote connectivity workflows. It can
+#   bootstrap SSH keys, copy them to a remote host, validate connectivity, and
+#   issue basic Tailscale lifecycle commands.
+#
+# COMMANDS
+#   connect        Open an interactive SSH session.
+#   ssh-setup      Generate keys, copy them to the remote, and test the login.
+#   tailscale-up   Invoke `tailscale up` on the remote (optionally enabling SSH).
+#   tailscale-down Stop the Tailscale daemon on the remote host.
+#   tailscale-status
+#                  Show `tailscale status` for the remote host.
+#   tailscale-ip   Print the remote host's IPv4 address from Tailscale.
+#
+# ENVIRONMENT
+#   LOG_LEVEL      Controls verbosity when sourcing lib/log.sh (default: INFO).
+
 set -euo pipefail
 IFS=$'\n\t'
 
-# Resolve script directory to source log.sh reliably
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/lib/log.sh"
+if ! source "$SCRIPT_DIR/lib/log.sh" 2>/dev/null; then
+  error() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+  warn()  { printf '[WARN]  %s\n' "$*" >&2; }
+  info()  { printf '[INFO]  %s\n' "$*" >&2; }
+fi
+
+if ! declare -F log_info >/dev/null; then
+  log_info() { info "$@"; }
+fi
+if ! declare -F log_warn >/dev/null; then
+  log_warn() { warn "$@"; }
+fi
+if ! declare -F log_error >/dev/null; then
+  log_error() { error "$@"; }
+fi
 
 usage() {
+  local exit_code="${1:-0}"
   cat <<EOF
-Usage: $0 COMMAND [options]
+Usage: $(basename "$0") COMMAND [options]
 
 Commands:
-  connect          Connect to remote via SSH
-  ssh-setup        Setup SSH keys, copy key, test connection
-  tailscale-up     Bring up tailscale daemon on remote (with optional --ssh)
-  tailscale-down   Bring down tailscale daemon on remote
-  tailscale-status Show tailscale status on remote
-  tailscale-ip     Show tailscale IPs on remote
+  connect            Connect to remote via SSH
+  ssh-setup          Generate keys, copy them to the remote, and test login
+  tailscale-up       Bring up Tailscale on the remote (pass --ssh to enable)
+  tailscale-down     Stop the remote Tailscale daemon
+  tailscale-status   Show Tailscale status on the remote host
+  tailscale-ip       Show the remote host's IPv4 Tailscale address
 
-Options for ssh-setup:
+Global options:
   -r, --remote USER@HOST    Remote SSH target (required)
   -p, --port PORT           SSH port (default: 22)
-  -g, --gen-key             Generate SSH key if missing
-  -c, --copy-key            Copy SSH key to remote
-  -t, --test                Test SSH connection
 
-Options for tailscale-up:
-  -r, --remote USER@HOST    Remote SSH target (required)
-  -p, --port PORT           SSH port for remote connection (default: 22)
-  --ssh                     Enable tailscale SSH feature
-
-Options for connect:
-  -r, --remote USER@HOST    Remote SSH target (required)
-  -p, --port PORT           SSH port (default: 22)
+Additional options:
+  ssh-setup
+      -g, --gen-key         Generate an ed25519 keypair if missing
+      -c, --copy-key        Copy the public key to the remote host
+      -t, --test            Test SSH connectivity once keys are in place
+  tailscale-up
+      --ssh                 Enable the Tailscale SSH feature when bringing up
 
 Examples:
-  $0 connect -r user@host -p 2222
-  $0 ssh-setup -r user@host -p 2222 -g -c -t
-  $0 tailscale-up -r user@host --ssh
+  $(basename "$0") connect -r user@host -p 2222
+  $(basename "$0") ssh-setup -r user@host -g -c -t
+  $(basename "$0") tailscale-up -r user@host --ssh
 EOF
-  exit 0
+  exit "$exit_code"
 }
 
 if [[ $# -lt 1 ]]; then
-  usage
+  usage 1
 fi
 
 CMD="$1"
@@ -58,7 +90,9 @@ TS_ENABLE_SSH=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help) usage ;;
+    -h|--help)
+      usage 0
+      ;;
     -r|--remote)
       REMOTE="$2"
       shift 2
@@ -84,15 +118,15 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     *)
-      error "Unknown option: $1"
-      usage
+      log_warn "Unknown option: $1 (see --help)"
+      usage 1
       ;;
   esac
 done
 
 if [[ -z "$REMOTE" ]]; then
-  error "Remote host is required."
-  usage
+  log_error "Remote host is required (use --remote or -r)."
+  exit 1
 fi
 
 SSH_KEY="$HOME/.ssh/id_ed25519"
@@ -104,69 +138,72 @@ ssh_exec() {
 
 case "$CMD" in
   connect)
-    info "Connecting to $REMOTE via SSH on port $PORT..."
+    log_info "Connecting to $REMOTE via SSH on port $PORT..."
     exec ssh -p "$PORT" "$REMOTE"
     ;;
 
   ssh-setup)
-    info "Starting SSH convenience setup for $REMOTE on port $PORT"
+    log_info "Starting SSH convenience setup for $REMOTE on port $PORT"
 
     if $GEN_KEY; then
       if [[ ! -f "$SSH_KEY" || ! -f "$SSH_PUB" ]]; then
-        info "Generating new SSH keypair..."
-        ssh-keygen -t ed25519 -f "$SSH_KEY" -N "" || { error "Failed to generate SSH keys"; exit 1; }
+        log_info "Generating new SSH keypair..."
+        if ! ssh-keygen -t ed25519 -f "$SSH_KEY" -N ""; then
+          log_error "Failed to generate SSH keys"
+          exit 1
+        fi
       else
-        info "SSH keypair already exists."
+        log_info "SSH keypair already exists."
       fi
     fi
 
     if $COPY_KEY; then
-      info "Copying SSH public key to $REMOTE..."
+      log_info "Copying SSH public key to $REMOTE..."
       if ssh-copy-id -p "$PORT" -i "$SSH_PUB" "$REMOTE"; then
-        info "Public key copied successfully."
+        log_info "Public key copied successfully."
       else
-        error "Failed to copy public key."
+        log_error "Failed to copy public key."
         exit 1
       fi
     fi
 
     if $TEST_CONN; then
-      info "Testing SSH connection to $REMOTE..."
+      log_info "Testing SSH connection to $REMOTE..."
       if ssh -p "$PORT" -o BatchMode=yes "$REMOTE" exit; then
-        info "SSH connection succeeded!"
+        log_info "SSH connection succeeded!"
       else
-        error "SSH connection test failed!"
+        log_error "SSH connection test failed!"
         exit 1
       fi
     fi
     ;;
 
   tailscale-up)
-    info "Bringing up tailscale on $REMOTE..."
-    CMD="sudo tailscale up"
+    log_info "Bringing up Tailscale on $REMOTE..."
+    ts_cmd=(sudo tailscale up)
     if $TS_ENABLE_SSH; then
-      CMD+=" --ssh"
+      ts_cmd+=(--ssh)
     fi
-    ssh_exec $CMD
+    ssh_exec "${ts_cmd[@]}"
     ;;
 
   tailscale-down)
-    info "Bringing down tailscale on $REMOTE..."
+    log_info "Bringing down Tailscale on $REMOTE..."
     ssh_exec sudo tailscale down
     ;;
 
   tailscale-status)
-    info "Fetching tailscale status on $REMOTE..."
+    log_info "Fetching Tailscale status on $REMOTE..."
     ssh_exec tailscale status
     ;;
 
   tailscale-ip)
-    info "Fetching tailscale IPs on $REMOTE..."
+    log_info "Fetching Tailscale IPv4 address on $REMOTE..."
     ssh_exec tailscale ip -4
     ;;
 
   *)
-    error "Unknown command: $CMD"
-    usage
+    log_error "Unknown command: $CMD"
+    exit 1
     ;;
 esac
