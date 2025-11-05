@@ -1,52 +1,39 @@
 # Scripts Toolkit
 
-This repository hosts a collection of Bash utilities and higher level scripts used for
-media management and host provisioning. The layout mirrors how the scripts are
-consumed on the target systems so everything can be copied or sourced directly.
+Collection of Bash helpers for media sync and host setup. Clone the repo and run the
+scripts from its root so the relative paths work.
 
-## Repository layout
+## Scripts
 
-- `bin/` – portable wrappers and helper binaries. The `bats` wrapper ships with the
-  repo so the test suite can run without a global installation.
-- `lib/` – reusable shell libraries that individual scripts source. Each file stays
-  dependency-light and provides fallbacks so they can be consumed in isolation.
-- `tests/` – Bats integration tests for both the libraries and higher level glue
-  scripts. Test files can be run individually or as a suite.
-- `*.sh` – top-level scripts that orchestrate media synchronization and host setup
-  using the primitives exposed in `lib/`.
+| Script | What it does | Quick use |
+| ------ | ------------- | --------- |
+| `sync_shows.sh` | Pull TV show libraries with `rsync`. | `./sync_shows.sh` |
+| `sync_movies.sh` | Pull movie libraries with `rsync`. | `./sync_movies.sh` |
+| `jellyfinctl.sh` | Manage Jellyfin (start/stop/restart/status). | `./jellyfinctl.sh restart` |
+| `media_server_setup.sh` | Install Jellyfin, dependencies, and service files. | `./media_server_setup.sh` |
+| `netctl.sh` | Set up SSH keys, check connectivity, toggle Tailscale. | `./netctl.sh login user@host` |
+| `c_setup.sh` | Bootstrap a minimal C project (dirs, Makefile, git optional). | `./c_setup.sh my_app` |
+| `py_venv_setup.sh` | Create a local Python venv with common tooling. | `./py_venv_setup.sh` |
+| `setup-zsh-tmux.sh` | Install dotfiles and plugins for zsh+tmux. | `./setup-zsh-tmux.sh` |
 
-## Usage
+## Libraries
 
-Most scripts are intended to be sourced or executed from within the repository
-root so that relative paths resolve correctly. For example, to synchronize TV
-shows you can run:
-
-```bash
-./sync_shows.sh
-```
-
-Library helpers can also be sourced directly from other scripts:
+Reusable functions live in `lib/`. Source them if you only need a helper:
 
 ```bash
-source "$(pwd)/lib/download.sh"
-download_file "https://example.com/tool.tar.gz"
+source lib/download.sh
 ```
 
-## Testing
+## Tests
 
-All automated tests are implemented with [Bats](https://bats-core.readthedocs.io/).
-The repository includes a vendored runner so you only need Bash and standard Unix
-utilities. To execute the full suite run:
+The repo bundles Bats so you can run the suite with:
 
 ```bash
-bin/bats tests
+bin/bats tests/*.bats
 ```
 
-You can also target an individual file during development:
+Run a single file the same way if you are working on one area:
 
 ```bash
-bin/bats tests/system_info.bats
+bin/bats tests/netctl.bats
 ```
-
-Each test creates its own temporary sandbox so it can run on a developer
-workstation or in CI without elevated privileges.
