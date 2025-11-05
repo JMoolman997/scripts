@@ -1,27 +1,35 @@
 #!/usr/bin/env bash
+# c_setup.sh — bootstrap a minimal C project skeleton with optional git init
+#
+# SYNOPSIS
+#   ./c_setup.sh COMMAND
+#
+# DESCRIPTION
+#   Creates a conventional `src/`, `tests/`, and `build/` directory structure,
+#   writes a starter Makefile, and can optionally initialise a git repository.
+#   The script prefers the logging helpers from lib/log.sh but will fall back to
+#   plain stderr messages when the library is unavailable.
+
 set -euo pipefail
 IFS=$'\n\t'
 
-#__Source_shared_functions__#
-SCRIPT_PATH="${BASH_SOURCE[0]}"
-# resolve symlink
-while [ -L "$SCRIPT_PATH" ]; do
-	SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
-done
-SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-
-LOG_LIB="$SCRIPT_DIR/lib/log.sh"
-if [[ ! -f "$LOG_LIB" ]]; then
-	echo "[ERROR] Could not find $LOG_LIB" >&2
-	exit 1
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if ! source "$SCRIPT_DIR/lib/log.sh" 2>/dev/null; then
+  error() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+  warn()  { printf '[WARN]  %s\n' "$*" >&2; }
+  info()  { printf '[INFO]  %s\n' "$*" >&2; }
 fi
 
-# shellcheck 
-. "$LOG_LIB"
+if ! declare -F log_info >/dev/null; then
+  log_info() { info "$@"; }
+fi
+if ! declare -F log_warn >/dev/null; then
+  log_warn() { warn "$@"; }
+fi
+if ! declare -F log_error >/dev/null; then
+  log_error() { error "$@"; }
+fi
 
-info "log.sh sourced succesfully"
-
-#__CONFIGURATION__#
 PROJECT_ROOT="$(pwd)"
 SRC_DIR="$PROJECT_ROOT/src"
 TEST_DIR="$PROJECT_ROOT/tests"
@@ -30,30 +38,29 @@ MAKEFILE="$PROJECT_ROOT/Makefile"
 
 : "${BINARY:=exec}"
 
-#__HELPERS__#
 usage() {
-  printf '\e[94m[Usage]\e[0m %s\n\n' "$(basename "$0") <command>"
   cat <<EOF
+Usage: $(basename "$0") <command>
+
 Commands:
-  scaffold   Create src/, tests/, build/, Makefile & .gitignore
-  git        Initialize a Git repo, add all files, make initial commit
-  all        Do both scaffold + git
+  scaffold   Create src/, tests/, build/, Makefile, and .gitignore
+  git        Initialise a git repo, add files, and make the first commit
+  all        Run both scaffold and git commands in sequence
   help       Show this message
 EOF
 }
 
-#__Init project function__
 init_scaffold() {
-info "Scaffolding in: $PROJECT_ROOT"
-mkdir -p "$SRC_DIR" "$TEST_DIR" "$BUILD_DIR"
+  log_info "Scaffolding project directories under $PROJECT_ROOT"
+  mkdir -p "$SRC_DIR" "$TEST_DIR" "$BUILD_DIR"
 
-if [[ -e "$MAKEFILE" ]]; then
-	error "Makefile already exists at $MAKEFILE"
-fi
+  if [[ -e "$MAKEFILE" ]]; then
+    log_error "Makefile already exists at $MAKEFILE"
+    exit 1
+  fi
 
-info "Generating Makefile…"
-
-cat > "$MAKEFILE" << 'EOF'
+  log_info "Generating Makefile..."
+  cat >"$MAKEFILE" <<'MAKEEOF'
 #—————————————————————————————————————————————
 # Project Makefile – basic C build
 #—————————————————————————————————————————————
@@ -67,7 +74,7 @@ BINARY  := ${BINARY}
 SOURCES := $(wildcard $(SRC_DIR)/*.c)
 OBJS    := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(SOURCES))
 
-.PHONY: all clean test help
+.PHONY: all clean help
 
 all: $(OBJ_DIR)/$(BINARY)
 
@@ -93,21 +100,28 @@ help:
 	@echo "  all    Build the '$(BINARY)' executable"
 	@echo "  clean  Remove build artifacts in '$(OBJ_DIR)'"
 	@echo "  help   Show this help message"
-EOF
+MAKEEOF
 
-info $'Done! The following has been created:\n'\
-$'  • '"$PROJECT_ROOT"$'\n'\
+  log_info $'Created project layout:\n'\
 $'  • '"$SRC_DIR"$'\n'\
 $'  • '"$TEST_DIR"$'\n'\
 $'  • '"$BUILD_DIR"$'\n'\
 $'  • '"$MAKEFILE"$'\n'
-
 }
 
-#__Git init function__
 init_git() {
-info "Writing .gitignore…"
-cat > "$PROJECT_ROOT/.gitignore" <<'EOF'
+  if [[ -d .git ]]; then
+    log_error "A git repository already exists at $PROJECT_ROOT"
+    exit 1
+  fi
+
+  if ! command -v git >/dev/null 2>&1; then
+    log_error "git command not found"
+    exit 1
+  fi
+
+  log_info "Writing .gitignore..."
+  cat >"$PROJECT_ROOT/.gitignore" <<'GITEOF'
 # build artifacts
 build/
 
@@ -126,29 +140,40 @@ app
 
 # logs
 *.log
-EOF
+GITEOF
 
-info "Initializing git repository…"
-if [ -d .git ]; then
-	error "A Git repo already exists here."
-fi
-git init
-git add .
-git commit -m "Initial commit"
-info "Git repo initialized – first commit created."
+  log_info "Initialising git repository..."
+  git init
+  git add .
+  git commit -m "Initial commit"
+  log_info "Git repo initialised – first commit created."
 }
 
 main() {
-  if [ $# -lt 1 ]; then
-    usage; exit 1
+  if [[ $# -lt 1 ]]; then
+    usage
+    exit 1
   fi
 
   case "$1" in
-    scaffold) init_scaffold ;;
-    git)      init_git      ;;
-    all)      init_scaffold && init_git ;;
-    help)     usage         ;;
-    *)        error "Unknown command: $1" ;;
+    scaffold)
+      init_scaffold
+      ;;
+    git)
+      init_git
+      ;;
+    all)
+      init_scaffold
+      init_git
+      ;;
+    help|-h|--help)
+      usage
+      ;;
+    *)
+      log_error "Unknown command: $1"
+      usage
+      exit 1
+      ;;
   esac
 }
 
