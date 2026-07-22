@@ -2,28 +2,112 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# Load logging library
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$SCRIPT_DIR/log.sh"
+if ! source "$SCRIPT_DIR/lib/log.sh" 2>/dev/null; then
+  error() { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+  warn()  { printf '[WARN]  %s\n' "$*" >&2; }
+  info()  { printf '[INFO]  %s\n' "$*" >&2; }
+fi
 
-# ---- CONFIG ---- #
-USER_NAME="${1:-$USER}"
-MEDIA_DIR="/home/${USER_NAME}/Videos"
-INSTALL_JELLYFIN=true
-INSTALL_XFCE=true
-INSTALL_SAMBA=true
-INSTALL_DOCKER=false
+if [[ -f "$SCRIPT_DIR/lib/system_info.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "$SCRIPT_DIR/lib/system_info.sh"
+fi
 
-# ---- SYSTEM CHECK ---- #
+usage() {
+  cat <<'EOF'
+Usage: media_server_setup.sh [options]
+
+Options:
+  --user NAME           Target user that should own media directories (default: current user)
+  --media-dir PATH      Media root (default: /home/<user>/Videos)
+  --[no-]jellyfin       Enable/disable Jellyfin install (default: enabled)
+  --[no-]xfce           Enable/disable XFCE desktop install (default: enabled)
+  --[no-]samba          Enable/disable Samba setup (default: enabled)
+  --[no-]docker         Enable/disable Docker install (default: disabled)
+  -h, --help            Show this help text
+
+Environment overrides:
+  INSTALL_JELLYFIN, INSTALL_XFCE, INSTALL_SAMBA, INSTALL_DOCKER (0/1 flags)
+  MEDIA_DIR, TARGET_USER
+EOF
+  exit "${1:-0}"
+}
+
+bool_from_env() {
+  local value="$1"
+  local normalized="${value,,}"
+  if [[ "$normalized" =~ ^(0|false|no)$ ]]; then
+    printf '0'
+  else
+    printf '1'
+  fi
+}
+
+INSTALL_JELLYFIN="$(bool_from_env "${INSTALL_JELLYFIN:-1}")"
+INSTALL_XFCE="$(bool_from_env "${INSTALL_XFCE:-1}")"
+INSTALL_SAMBA="$(bool_from_env "${INSTALL_SAMBA:-1}")"
+INSTALL_DOCKER="$(bool_from_env "${INSTALL_DOCKER:-0}")"
+USER_NAME="${TARGET_USER:-$USER}"
+MEDIA_DIR="${MEDIA_DIR:-}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --user)
+      USER_NAME="$2"; shift 2;;
+    --media-dir)
+      MEDIA_DIR="$2"; shift 2;;
+    --jellyfin)        INSTALL_JELLYFIN=1; shift;;
+    --no-jellyfin)     INSTALL_JELLYFIN=0; shift;;
+    --xfce)            INSTALL_XFCE=1; shift;;
+    --no-xfce)         INSTALL_XFCE=0; shift;;
+    --samba)           INSTALL_SAMBA=1; shift;;
+    --no-samba)        INSTALL_SAMBA=0; shift;;
+    --docker)          INSTALL_DOCKER=1; shift;;
+    --no-docker)       INSTALL_DOCKER=0; shift;;
+    -h|--help)         usage 0;;
+    --) shift; break;;
+    -*)
+      error "Unknown flag: $1"
+      ;;
+    *)
+      # Backwards compatibility: allow positional user override
+      USER_NAME="$1"
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$MEDIA_DIR" ]]; then
+  MEDIA_DIR="/home/${USER_NAME}/Videos"
+fi
+
+# Expand ~ expressions safely.
+if [[ "$MEDIA_DIR" == ~* ]]; then
+  MEDIA_DIR="$(eval echo "$MEDIA_DIR")"
+fi
+
+[[ "$EUID" -eq 0 ]] || error "This script must be run as root"
+
+if declare -F detect_os >/dev/null 2>&1; then
+  HOST_OS="$(detect_os)"
+else
+  if [[ -f /etc/debian_version ]]; then
+    HOST_OS="debian"
+  else
+    HOST_OS="unknown"
+  fi
+fi
+
+[[ "$HOST_OS" == "debian" ]] || error "Only Debian-based systems are supported (APT required)."
+command -v apt >/dev/null 2>&1 || error "apt not found; please run on a Debian/Ubuntu host."
+
 info "Starting media server setup for user: $USER_NAME"
-[[ "$EUID" -ne 0 ]] && error "This script must be run as root"
 
-# ---- PACKAGE UPDATE ---- #
 info "Updating APT packages..."
 apt update && apt upgrade -y
 
-# ---- DESKTOP ---- #
-if $INSTALL_XFCE; then
+if [[ "$INSTALL_XFCE" -eq 1 ]]; then
   info "Installing XFCE desktop environment..."
   apt install -y xfce4 lightdm
   systemctl enable lightdm
@@ -31,8 +115,7 @@ else
   warn "XFCE installation skipped"
 fi
 
-# ---- JELLYFIN ---- #
-if $INSTALL_JELLYFIN; then
+if [[ "$INSTALL_JELLYFIN" -eq 1 ]]; then
   info "Installing Jellyfin media server..."
   apt install -y apt-transport-https curl gnupg
   curl -fsSL https://repo.jellyfin.org/debian/jellyfin_team.gpg.key | gpg --dearmor -o /usr/share/keyrings/jellyfin-archive-keyring.gpg
@@ -44,8 +127,7 @@ else
   warn "Jellyfin installation skipped"
 fi
 
-# ---- SAMBA ---- #
-if $INSTALL_SAMBA; then
+if [[ "$INSTALL_SAMBA" -eq 1 ]]; then
   info "Installing Samba..."
   apt install -y samba
   tee -a /etc/samba/smb.conf > /dev/null <<EOF
@@ -61,8 +143,7 @@ else
   warn "Samba installation skipped"
 fi
 
-# ---- DOCKER ---- #
-if $INSTALL_DOCKER; then
+if [[ "$INSTALL_DOCKER" -eq 1 ]]; then
   info "Installing Docker..."
   apt install -y ca-certificates gnupg
   install -m 0755 -d /etc/apt/keyrings
@@ -77,11 +158,9 @@ else
   warn "Docker installation skipped"
 fi
 
-# ---- USER SETUP ---- #
 info "Ensuring media directory exists..."
 mkdir -p "$MEDIA_DIR"
 chown "$USER_NAME:$USER_NAME" "$MEDIA_DIR"
 
-# ---- DONE ---- #
 info "Media server setup complete."
 custom_log "Access" "$COLOR_CYAN" "Jellyfin available at http://<your-ip>:8096 if installed"

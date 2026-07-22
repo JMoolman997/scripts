@@ -77,6 +77,7 @@ resolve_source() {
 SCRIPT_SOURCE="$(resolve_source "${BASH_SOURCE[0]:-$0}")"
 SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_SOURCE")" && pwd)"
 DOTFILES_DIR="${DOTFILES_DIR:-$HOME/dotfiles}"
+DOTFILES_REMOTE="${DOTFILES_REMOTE:-}"
 LIB_DIR="${LIB_DIR:-$SCRIPT_DIR/lib}"
 BACKUP_DIR="${BACKUP_DIR:-$HOME/dotfiles_backup/$(date +%Y%m%d_%H%M%S)}"
 DRY_RUN=0
@@ -91,6 +92,7 @@ Usage: $0 [--dotfiles-dir PATH] [--dry-run] [--no-network] [--help]
 
 Options:
   --dotfiles-dir PATH   Location of your dotfiles (default: $DOTFILES_DIR)
+  --dotfiles-remote URL Git remote to clone when DOTFILES_DIR is missing
   --dry-run             Print actions but don't execute (safe check)
   --no-network          Skip cloning / network installs (useful offline)
   --help                Show this help
@@ -101,6 +103,7 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dotfiles-dir) DOTFILES_DIR="$2"; shift 2;;
+    --dotfiles-remote) DOTFILES_REMOTE="$2"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
     --no-network) NO_NETWORK=1; shift;;
     --help) usage;;
@@ -256,18 +259,37 @@ install_packages() {
     log_info "NO_NETWORK enabled: skipping package install for ${pkgs[*]}"
     return 0
   fi
-  # If pkg_utils provides install_packages or pkg_install function, use it
-  if declare -f pkg_utils::install >/dev/null 2>&1; then
-    log_info "Using pkg_utils::install to install: ${pkgs[*]}"
+  local helper=""
+  case "$PKG_MANAGER" in
+    apt)
+      if declare -F install_with_apt >/dev/null 2>&1; then
+        helper="install_with_apt"
+      fi
+      ;;
+    pacman)
+      if declare -F install_with_pacman >/dev/null 2>&1; then
+        helper="install_with_pacman"
+      fi
+      ;;
+    brew)
+      if declare -F install_with_brew >/dev/null 2>&1; then
+        helper="install_with_brew"
+      fi
+      ;;
+    *)
+      log_warn "Unknown package manager. Please install: ${pkgs[*]} manually."
+      ;;
+  esac
+
+  if [[ -n "$helper" ]]; then
     if [[ $DRY_RUN -eq 1 ]]; then
-      log_info "DRY RUN: pkg_utils::install ${pkgs[*]}"
+      log_info "DRY RUN: $helper ${pkgs[*]}"
     else
-      pkg_utils::install "${pkgs[@]}"
+      "$helper" "${pkgs[@]}"
     fi
     return 0
   fi
 
-  # Fallback per-manager
   case "$PKG_MANAGER" in
     apt)
       run_cmd "sudo apt update && sudo apt install -y ${pkgs[*]}"
@@ -279,7 +301,7 @@ install_packages() {
       for p in "${pkgs[@]}"; do run_cmd "brew install $p"; done
       ;;
     *)
-      log_warn "Unknown package manager. Please install: ${pkgs[*]} manually."
+      log_warn "Unable to install packages automatically; please install: ${pkgs[*]}"
       ;;
   esac
 }
@@ -317,8 +339,19 @@ update_dotfiles_dir() {
     else
       git -C "$DOTFILES_DIR" pull --ff-only || true
     fi
+  elif [[ ! -d "$DOTFILES_DIR" ]]; then
+    if [[ -z "$DOTFILES_REMOTE" ]]; then
+      log_warn "Dotfiles dir '$DOTFILES_DIR' missing and DOTFILES_REMOTE not set; skipping clone."
+      return
+    fi
+    log_info "Cloning dotfiles from $DOTFILES_REMOTE into $DOTFILES_DIR"
+    if [[ $DRY_RUN -eq 1 ]]; then
+      log_info "DRY RUN: git clone '$DOTFILES_REMOTE' '$DOTFILES_DIR'"
+    else
+      git clone "$DOTFILES_REMOTE" "$DOTFILES_DIR"
+    fi
   else
-    log_info "No git repo found at $DOTFILES_DIR — skipping update (if you want cloning, pass a git URL into DOTFILES_DIR or clone manually)"
+    log_info "No git repo found at $DOTFILES_DIR — assuming local files are already present."
   fi
 }
 

@@ -378,7 +378,12 @@ find_remote_script() {
     "/usr/local/bin/$script_name"
   )
   for p in "${paths[@]}"; do
-    if remote_run_quiet "[ -x $p ]"; then
+    local remote_path="$p"
+    if [[ "$remote_path" == ~/* ]]; then
+      remote_path="\$HOME/${remote_path#~/}"
+    fi
+    remote_path="${remote_path//\"/\\\"}"
+    if remote_run_quiet "test -x \"$remote_path\""; then
       echo "$p"; return 0
     fi
   done

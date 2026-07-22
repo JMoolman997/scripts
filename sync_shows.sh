@@ -52,7 +52,7 @@ REMOTE_BASE_PATH="${REMOTE_BASE_PATH:-/mnt/media}"
 SYNC_PROFILE="${SYNC_PROFILE:-wan}"
 PREALLOCATE="${PREALLOCATE:-0}"
 COMP_LEVEL="${COMP_LEVEL:-6}"
-WORKERS="${WORKERS:-1}"
+WORKERS="${WORKERS:-3}"
 SSH_CIPHER="${SSH_CIPHER:-aes128-gcm@openssh.com}"
 DRY_RUN=0
 
@@ -125,7 +125,7 @@ shift $((OPTIND - 1))
 
 REMOTE_SHOWS_DIR="${REMOTE_BASE_PATH%/}/Shows"
 SUB_EXTS=(srt ass ssa vtt sub idx)
-EXCLUDES_REGEX='(?i)(sample|trailer|extras?)'
+EXCLUDES_REGEX='(sample|trailer|extras?)'
 
 sc_build_ssh_opts "$SSH_PORT" "$SSH_CIPHER"
 sc_build_rsync_opts "$SYNC_PROFILE" "$COMP_LEVEL" "$PREALLOCATE" "$DRY_RUN"
@@ -140,9 +140,16 @@ videos_manifest="$(mktemp)"
 sort_manifest="${videos_manifest}.sorted"
 dirs_manifest="$(mktemp)"
 dirs_sorted="${dirs_manifest}.sorted"
+filtered_manifest=""
 # Temporary manifests capture candidate videos and destination directories; the
 # trap ensures we always clean them up on exit.
-trap 'rm -f "$find_errors" "$videos_manifest" "$sort_manifest" "$dirs_manifest" "$dirs_sorted"' EXIT
+cleanup_manifests() {
+  rm -f "$find_errors" "$videos_manifest" "$sort_manifest" "$dirs_manifest" "$dirs_sorted"
+  if [[ -n "$filtered_manifest" ]]; then
+    rm -f "$filtered_manifest"
+  fi
+}
+trap cleanup_manifests EXIT
 
 # Allow find to encounter unreadable directories without aborting the script.
 set +e
@@ -151,6 +158,24 @@ find "$LOCAL_SHOWS_DIR" -type f \
   >"$videos_manifest" 2>"$find_errors"
 find_status=$?
 set -e
+
+if [[ -n "$EXCLUDES_REGEX" ]]; then
+  filtered_manifest="$(mktemp)"
+  set +e
+  grep -viE "$EXCLUDES_REGEX" "$videos_manifest" >"$filtered_manifest"
+  grep_status=$?
+  set -e
+  if (( grep_status == 0 )); then
+    mv "$filtered_manifest" "$videos_manifest"
+  elif (( grep_status == 1 )); then
+    : >"$videos_manifest"
+    rm -f "$filtered_manifest"
+  else
+    log_warn "Failed to filter junk filenames (exit $grep_status); continuing."
+    rm -f "$filtered_manifest"
+  fi
+  filtered_manifest=""
+fi
 
 set +e
 sort "$videos_manifest" >"$sort_manifest"
