@@ -15,6 +15,7 @@ scripts from its root so the relative paths work.
 | `c_setup.sh` | Bootstrap a minimal C project (dirs, Makefile, git optional). | `./c_setup.sh my_app` |
 | `py_venv_setup.sh` | Create a local Python venv with common tooling. | `./py_venv_setup.sh` |
 | `setup-zsh-tmux.sh` | Install dotfiles and plugins for zsh+tmux. | `./setup-zsh-tmux.sh` |
+| `LateX/inject_and_compile.py` | Inject invisible characters into a LaTeX source file and compile it to PDF. | `python3 LateX/inject_and_compile.py chars.txt input.tex -o output.tex` |
 
 ## Libraries
 
