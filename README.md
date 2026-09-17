@@ -16,7 +16,31 @@ scripts from its root so the relative paths work.
 | `py_venv_setup.sh` | Create a local Python venv with common tooling. | `./py_venv_setup.sh` |
 | `setup-zsh-tmux.sh` | Install dotfiles and plugins for zsh+tmux. | `./setup-zsh-tmux.sh` |
 | `LateX/inject_and_compile.py` | Inject invisible characters into a LaTeX source file and compile it to PDF. | `python3 LateX/inject_and_compile.py chars.txt input.tex -o output.tex` |
-| `experiment_runner.sh` | Repeat a command (up to 1,000,000 times) and summarize its run times and exit statuses; continues after crashed or OOM-killed runs, but stops the active run when the runner itself is interrupted. | `./experiment_runner.sh --repeat 5 -- ./my_program input.txt` |
+| `experiment_runner.sh` | Run and time arbitrary commands, with optional warmups, persistent results, and detached jobs. | `./experiment_runner.sh -r 5 -- ./my_program input.txt` |
+
+### Experiment runner
+
+Everything after `--` is passed as command arguments. The default is one measured
+run, with no timeout. Failed measured runs do not stop later runs unless
+`--stop-on-error` is set. A failed warmup stops the job.
+
+```bash
+./experiment_runner.sh -r 5 -- ./build/benchmark --size 10000
+./experiment_runner.sh -C ~/git/project -r 10 -- make benchmark THREADS=8
+./experiment_runner.sh -C ~/git/project -e SEED=42 -- python3 experiment.py
+./experiment_runner.sh --detach -l baseline -C ~/git/project -r 1000 -- ./planner scenario.json
+```
+
+Use `-w N` for warmups, `-e KEY=VALUE` for environment variables, `-i FILE`
+for input on each run, `--format jsonl` for machine-readable foreground results,
+and `-o DIR` to choose the persistent output root. Detached jobs default to
+`<cwd>/.agent/experiments/` and print their job directory and PID immediately.
+
+Each job directory contains `metadata.json`, an atomically updated `status.json`
+with a heartbeat about every 30 seconds, append-only `events.jsonl` and
+`results.jsonl`, per-run files under `stdout/` and `stderr/`, `pid`, and one
+of `RUNNING`, `DONE`, `FAILED`, or `CANCELLED`. To cancel a detached job, send
+`TERM` to the PID in its `pid` file.
 
 ## Libraries
 

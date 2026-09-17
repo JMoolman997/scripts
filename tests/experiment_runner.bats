@@ -60,7 +60,7 @@ setup() {
 @test "rejects invalid counts and missing commands" {
   run bash "$runner" --repeat 0 -- true
   [ "$status" -eq 2 ]
-  [[ "$output" == *'N must be a positive integer'* ]]
+  [[ "$output" == *'repeat must be a positive integer'* ]]
 
   run bash "$runner" --repeat 2 --
   [ "$status" -eq 2 ]
@@ -74,7 +74,7 @@ setup() {
 
   run bash "$runner" --repeat 1000001 -- true
   [ "$status" -eq 2 ]
-  [[ "$output" == *'N must not exceed 1000000'* ]]
+  [[ "$output" == *'repeat must not exceed 1000000'* ]]
 }
 
 @test "preserves command arguments and standard input" {
@@ -90,8 +90,112 @@ setup() {
   sleep 0.1
   kill -TERM "$runner_pid"
 
-  run wait "$runner_pid"
-  [ "$status" -eq 143 ]
+  if wait "$runner_pid"; then exit_code=0; else exit_code=$?; fi
+  [ "$exit_code" -eq 143 ]
   sleep 0.1
+  [ ! -e "$marker" ]
+}
+
+@test "uses cwd, environment, stdin, and warmups without counting warmups" {
+  printf 'input value\n' > "$BATS_TEST_TMPDIR/input"
+  run bash "$runner" -C "$BATS_TEST_TMPDIR" -i input -e 'EXPERIMENT_VALUE=hello world' \
+    -w 2 -r 3 -- bash -c 'read -r input; printf "%s|%s|%s\n" "$PWD" "$EXPERIMENT_VALUE" "$input"'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"$BATS_TEST_TMPDIR|hello world|input value"* ]]
+  [[ "$output" == *'Summary: 3 succeeded, 0 failed;'* ]]
+}
+
+@test "stops after a failed warmup or measured run when requested" {
+  run bash "$runner" -w 2 -r 3 -- false
+  [ "$status" -eq 1 ]
+  [[ "$output" != *'Run 1/3:'* ]]
+
+  run bash "$runner" -r 3 --stop-on-error -- false
+  [ "$status" -eq 1 ]
+  [[ "$output" == *'Run 1/3: exit 1,'* ]]
+  [[ "$output" != *'Run 2/3:'* ]]
+}
+
+@test "writes valid job JSON and preserves unusual argv" {
+  run bash "$runner" -o "$BATS_TEST_TMPDIR/jobs" -l 'odd " label' \
+    -- printf '%s\n' 'space quote" slash\ unicode-λ' '' $'line\nnext\tcell\001'
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'Summary: 1 succeeded, 0 failed;'* ]]
+  job=("$BATS_TEST_TMPDIR"/jobs/*)
+  [ -f "${job[0]}/DONE" ]
+  python3 - "${job[0]}" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+m = json.loads((p / 'metadata.json').read_text())
+assert m['label'] == 'odd " label'
+assert m['command'][-3:] == ['space quote" slash\\ unicode-λ', '', 'line\nnext\tcell\001']
+for name in ('status.json', 'events.jsonl', 'results.jsonl'):
+    for line in (p / name).read_text().splitlines():
+        json.loads(line)
+assert json.loads((p / 'status.json').read_text())['state'] == 'done'
+results = [json.loads(line) for line in (p / 'results.jsonl').read_text().splitlines()]
+assert results[-1]['type'] == 'summary' and results[-1]['runs'] == 1
+events = [json.loads(line) for line in (p / 'events.jsonl').read_text().splitlines()]
+assert [event['id'] for event in events] == list(range(1, len(events) + 1))
+PY
+}
+
+@test "persistent failures include signal and output paths" {
+  run bash "$runner" -o "$BATS_TEST_TMPDIR/jobs" -- bash -c 'kill -SEGV "$$"'
+  [ "$status" -eq 1 ]
+  job=("$BATS_TEST_TMPDIR"/jobs/*)
+  [ -f "${job[0]}/FAILED" ]
+  python3 - "${job[0]}" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+events = [json.loads(line) for line in (p / 'events.jsonl').read_text().splitlines()]
+failed = next(event for event in events if event['type'] == 'run_failed')
+assert failed['exit_code'] == 139 and failed['signal'] == 'SIGSEGV'
+assert (p / failed['stdout']).is_file() and (p / failed['stderr']).is_file()
+PY
+}
+
+@test "detached job reports failure and keeps per-run output" {
+  local poll
+  run bash "$runner" --detach -o "$BATS_TEST_TMPDIR/jobs" -- bash -c 'echo problem >&2; exit 7'
+  [ "$status" -eq 0 ]
+  job_dir=$(printf '%s\n' "$output" | sed -n 's/^job_dir=//p')
+  [ -n "$job_dir" ]
+  for ((poll=0; poll<100; poll++)); do
+    [ -f "$job_dir/FAILED" ] && break
+    sleep 0.05
+  done
+  [ -f "$job_dir/FAILED" ]
+  [ ! -e "$job_dir/RUNNING" ]
+  [[ $(<"$job_dir/stderr/run-000001.log") == problem ]]
+  python3 - "$job_dir" <<'PY'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+assert json.loads((p / 'status.json').read_text())['state'] == 'failed'
+events = [json.loads(line) for line in (p / 'events.jsonl').read_text().splitlines()]
+assert any(e['type'] == 'run_failed' and e['exit_code'] == 7 for e in events)
+PY
+}
+
+@test "detached cancellation stops the active child" {
+  local poll
+  marker="$BATS_TEST_TMPDIR/descendant-finished"
+  run bash "$runner" --detach -o "$BATS_TEST_TMPDIR/jobs" -- bash -c 'sleep 2; : > "$1"' _ "$marker"
+  [ "$status" -eq 0 ]
+  job_dir=$(printf '%s\n' "$output" | sed -n 's/^job_dir=//p')
+  for ((poll=0; poll<100; poll++)); do
+    child_pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("child_pid") or "")' "$job_dir/status.json")
+    [ -n "$child_pid" ] && break
+    sleep 0.05
+  done
+  [ -n "$child_pid" ]
+  kill -TERM "$(<"$job_dir/pid")"
+  for ((poll=0; poll<100; poll++)); do
+    [ -f "$job_dir/CANCELLED" ] && break
+    sleep 0.05
+  done
+  [ -f "$job_dir/CANCELLED" ]
+  ! kill -0 "$child_pid" 2>/dev/null
+  sleep 2.1
   [ ! -e "$marker" ]
 }
