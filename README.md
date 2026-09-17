@@ -16,6 +16,7 @@ scripts from its root so the relative paths work.
 | `py_venv_setup.sh` | Create a local Python venv with common tooling. | `./py_venv_setup.sh` |
 | `setup-zsh-tmux.sh` | Install dotfiles and plugins for zsh+tmux. | `./setup-zsh-tmux.sh` |
 | `LateX/inject_and_compile.py` | Inject invisible characters into a LaTeX source file and compile it to PDF. | `python3 LateX/inject_and_compile.py chars.txt input.tex -o output.tex` |
+| `experiment_runner.sh` | Repeat a command and summarize its run times and exit statuses. | `./experiment_runner.sh --repeat 5 -- ./my_program input.txt` |
 
 ## Libraries
 
