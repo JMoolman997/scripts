@@ -26,13 +26,19 @@ usage_error() { printf 'Error: %s\n' "$1" >&2; usage >&2; exit 2; }
 error() { printf 'Error: %s\n' "$1" >&2; exit 2; }
 timestamp() { date -u '+%Y-%m-%dT%H:%M:%SZ'; }
 if (( BASH_VERSINFO[0] >= 5 )) && [[ -n ${EPOCHREALTIME-} ]]; then
+  # EPOCHREALTIME is seconds with exactly six fractional digits. Removing the
+  # decimal point gives an integer microsecond timestamp without external tools.
   now_us() { printf '%s\n' "${EPOCHREALTIME/./}"; }
 else
+  # Older Bash versions only expose whole seconds, so timing remains valid but
+  # has one-second resolution.
   now_us() { printf '%s\n' "$((SECONDS * 1000000))"; }
 fi
 format_us() { printf '%d.%06d' "$(( $1 / 1000000 ))" "$(( $1 % 1000000 ))"; }
 
 json_string() {
+  # LC_ALL=C (set above) makes Bash iterate over bytes. Printable UTF-8 bytes
+  # can therefore pass through unchanged while JSON control bytes are escaped.
   local value=$1 char code out='"' i
   for ((i=0; i<${#value}; i++)); do
     char=${value:i:1}
@@ -52,14 +58,31 @@ json_string() {
 parse_count() {
   local value=$1 limit=$2 name=$3
   [[ $value =~ ^[0-9]+$ ]] || usage_error "$name must be a non-negative integer"
+  # Check length before arithmetic so an enormous user value cannot overflow
+  # Bash's signed integer parser. 10# also prevents 08 being treated as octal.
   (( ${#value} <= ${#limit} )) || usage_error "$name must not exceed $limit"
   REPLY=$((10#$value))
   ((REPLY <= limit)) || usage_error "$name must not exceed $limit"
+}
+set_environment() {
+  # `env A=old A=new command` uses the final value. Coalescing here preserves
+  # that behavior and also prevents duplicate keys in metadata.json.
+  local assignment=$1 key=${1%%=*} index
+  for index in "${!env_args[@]}"; do
+    if [[ ${env_args[index]%%=*} == "$key" ]]; then
+      env_args[index]=$assignment
+      return
+    fi
+  done
+  env_args+=("$assignment")
 }
 
 repeat=1 warmup=0 cwd=$PWD stdin_file= output_root= label=experiment
 display_format=text detach=0 stop_on_error=0 worker=0 job_dir=
 env_args=()
+# --worker is an internal second-pass mode used by --detach. The foreground
+# process creates the job directory, then the worker parses the original public
+# arguments again and writes results into that already-created directory.
 if [[ ${1-} == --worker ]]; then
   worker=1 job_dir=${2-}
   [[ -n $job_dir ]] || exit 2
@@ -77,7 +100,7 @@ while (($#)); do
     -C|--cwd) (($# >= 2)) || usage_error 'missing working directory'; cwd=$2; shift 2 ;;
     -e|--env) (($# >= 2)) || usage_error 'missing environment assignment'
       [[ $2 =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || usage_error 'environment must be KEY=VALUE'
-      env_args+=("$2"); shift 2 ;;
+      set_environment "$2"; shift 2 ;;
     -i|--stdin) (($# >= 2)) || usage_error 'missing stdin file'; stdin_file=$2; shift 2 ;;
     -o|--output-dir) (($# >= 2)) || usage_error 'missing output directory'; output_root=$2; shift 2 ;;
     -l|--label) (($# >= 2)) || usage_error 'missing label'; label=$2; shift 2 ;;
@@ -148,6 +171,8 @@ write_metadata() {
 }
 write_status() {
   ((persistent)) || return 0
+  # USR1 heartbeat traps may run while another status update is in progress.
+  # Avoid a nested write, and use rename below so readers never see partial JSON.
   ((status_writing)) && return 0
   status_writing=1
   local current_time temp
@@ -191,6 +216,8 @@ heartbeat_tick=0
 on_heartbeat() { heartbeat_tick=1; write_status; }
 start_heartbeat() {
   ((persistent)) || return 0
+  # The timer runs in a subshell, but Bash keeps $$ equal to the parent shell's
+  # PID there. USR1 consequently wakes the runner, not the timer process.
   (
     trap 'kill "$sleep_pid" 2>/dev/null || true; wait "$sleep_pid" 2>/dev/null || true; exit' TERM HUP INT
     while :; do
@@ -233,6 +260,9 @@ handle_signal() {
   trap - HUP INT TERM
   append_event cancellation_requested warning ",\"signal\":$(json_string "SIG$signal")"
   if [[ -n $child_pid ]]; then
+    # Monitor mode gives each asynchronous command its own process group whose
+    # ID is child_pid. Signal the group to include descendants, with a direct
+    # child signal as a fallback on shells/platforms without that grouping.
     kill -s "$signal" -- "-$child_pid" 2>/dev/null || kill -s "$signal" "$child_pid" 2>/dev/null || true
     wait "$child_pid" 2>/dev/null || true
   fi
@@ -261,23 +291,30 @@ execute_one() {
     append_event warmup_started info ",\"run\":$number"
   fi
   start=$(now_us)
+  # Keep command construction in one place; the branches below only select
+  # input and output destinations. A backgrounded shell function runs in a
+  # subshell; exec replaces that subshell with the command, making $! the PID
+  # that status reporting and cancellation should track.
+  run_command() { cd -- "$cwd" && exec env "${env_args[@]}" "${command[@]}"; }
   if ((persistent)); then
     if [[ -n $stdin_file ]]; then
-      (cd -- "$cwd" && exec env "${env_args[@]}" "${command[@]}") < "$stdin_file" > "$job_dir/$out_path" 2> "$job_dir/$err_path" &
+      run_command < "$stdin_file" > "$job_dir/$out_path" 2> "$job_dir/$err_path" &
     else
-      (cd -- "$cwd" && exec env "${env_args[@]}" "${command[@]}") <&0 > "$job_dir/$out_path" 2> "$job_dir/$err_path" &
+      run_command <&0 > "$job_dir/$out_path" 2> "$job_dir/$err_path" &
     fi
   elif [[ -n $stdin_file ]]; then
     if [[ $display_format == jsonl ]]; then
-      (cd -- "$cwd" && exec env "${env_args[@]}" "${command[@]}") < "$stdin_file" 1>&2 &
+      # Reserve stdout for valid JSONL records; command output remains visible
+      # on stderr in machine-readable mode.
+      run_command < "$stdin_file" 1>&2 &
     else
-      (cd -- "$cwd" && exec env "${env_args[@]}" "${command[@]}") < "$stdin_file" &
+      run_command < "$stdin_file" &
     fi
   else
     if [[ $display_format == jsonl ]]; then
-      (cd -- "$cwd" && exec env "${env_args[@]}" "${command[@]}") <&0 1>&2 &
+      run_command <&0 1>&2 &
     else
-      (cd -- "$cwd" && exec env "${env_args[@]}" "${command[@]}") <&0 &
+      run_command <&0 &
     fi
   fi
   child_pid=$!
@@ -288,6 +325,8 @@ execute_one() {
     heartbeat_tick=0
     if wait "$child_pid"; then status=0; break
     else status=$?; fi
+    # A USR1 heartbeat interrupts Bash's wait. Retry only in that case; any
+    # other nonzero status is the command's real exit status.
     ((heartbeat_tick)) || break
   done
   stop_heartbeat
@@ -331,12 +370,16 @@ execute_one() {
 }
 
 if ((detach && !worker)); then
+  # Resolve the script before leaving the foreground process so the worker does
+  # not depend on PATH or on the caller retaining its current directory.
   script_path=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")
   : > "$job_dir/runner.stdout"
   : > "$job_dir/runner.stderr"
   nohup "$script_path" --worker "$job_dir" "${original_args[@]}" \
     < /dev/null > "$job_dir/runner.stdout" 2> "$job_dir/runner.stderr" &
   worker_pid=$!
+  # Do not report a detached job until the worker has produced its first atomic
+  # status file. This turns immediate startup failures into caller-visible errors.
   for ((attempt=0; attempt<100; attempt++)); do
     [[ -f $job_dir/status.json ]] && break
     if ! kill -0 "$worker_pid" 2>/dev/null; then

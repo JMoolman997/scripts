@@ -105,6 +105,21 @@ setup() {
   [[ "$output" == *'Summary: 3 succeeded, 0 failed;'* ]]
 }
 
+@test "uses the last value for duplicate environment assignments" {
+  run bash "$runner" -o "$BATS_TEST_TMPDIR/jobs" \
+    -e 'EXPERIMENT_VALUE=old' -e 'EXPERIMENT_VALUE=new value' -- \
+    bash -c 'printf "%s\n" "$EXPERIMENT_VALUE"'
+
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'new value'* ]]
+  job=("$BATS_TEST_TMPDIR"/jobs/*)
+  python3 - "${job[0]}/metadata.json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as metadata:
+    assert json.load(metadata)['environment'] == {'EXPERIMENT_VALUE': 'new value'}
+PY
+}
+
 @test "stops after a failed warmup or measured run when requested" {
   run bash "$runner" -w 2 -r 3 -- false
   [ "$status" -eq 1 ]
