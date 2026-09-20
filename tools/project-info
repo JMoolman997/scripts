@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=../lib/project_common.sh
+source "$root_dir/lib/project_common.sh"
+project="$(project_dir "${1:?project path required}")"
+
+printf 'Project: %s\n' "$project"
+for item in Makefile CMakeLists.txt meson.build Cargo.toml pyproject.toml package.json compile_commands.json .git tests test; do
+  [[ -e "$project/$item" ]] && printf 'Found: %s\n' "$item"
+done
+if build="$(find_cmake_build "$project")"; then printf 'Configured CMake build: %s\n' "$build"; fi
+if build="$(find_meson_build "$project")"; then printf 'Configured Meson build: %s\n' "$build"; fi
+

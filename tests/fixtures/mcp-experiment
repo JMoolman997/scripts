@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+
+case ${1-} in
+  verify)
+    command -v jq >/dev/null 2>&1 || { printf 'jq is required\n' >&2; exit 1; }
+    [[ -x $repo_root/experiment_runner.sh ]] || { printf 'experiment runner is not executable\n' >&2; exit 1; }
+    jq -cn --arg cwd "$repo_root" '{
+      name:"mcp_test_fixture",
+      description:"Test-only fixed detached experiment.",
+      command:["tests/fixtures/mcp-experiment","execute"],
+      cwd:$cwd,
+      repeat:2,
+      warmup:0,
+      runtime_limit:null,
+      warnings:["No forced runtime limit."]
+    }'
+    ;;
+  run)
+    (($# == 2)) || { printf 'run requires one output root\n' >&2; exit 2; }
+    output_root=$2
+    exec "$repo_root/experiment_runner.sh" --detach --format jsonl \
+      -C "$repo_root" -o "$output_root" -l mcp-test -r 2 -- "$0" execute
+    ;;
+  execute)
+    sleep_for=${MCP_TEST_FIXTURE_SLEEP-0}
+    [[ $sleep_for =~ ^[0-9]+([.][0-9]+)?$ ]] || { printf 'invalid fixture sleep\n' >&2; exit 2; }
+    [[ $sleep_for == 0 ]] || sleep "$sleep_for"
+    printf 'fixture "stdout"\nsecond line\n'
+    printf 'fixture diagnostic on stderr\n' >&2
+    ;;
+  *)
+    printf 'expected verify, run, or execute\n' >&2
+    exit 2
+    ;;
+esac

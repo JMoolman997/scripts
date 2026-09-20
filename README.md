@@ -50,6 +50,13 @@ Reusable functions live in `lib/`. Source them if you only need a helper:
 source lib/download.sh
 ```
 
+## Zed MCP development tools
+
+The optional [Bash MCP server](mcp/README.md) exposes nine explicit local
+inspection and experiment-management operations to Zed Agent without an MCP
+SDK or language runtime. Experiment execution uses an empty-by-default allowlist
+of audited Bash wrappers; arbitrary commands are never accepted through MCP.
+
 ## Tests
 
 ```bash

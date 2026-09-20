@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# shellcheck source=../lib/system_info.sh
+source "$root_dir/lib/system_info.sh"
+
+printf 'OS: %s\n' "$(detect_os)"
+printf 'CPU:\n'
+get_cpu_info
+printf 'RAM: %s\n' "$(get_total_ram)"
+printf 'Disk: %s\n' "$(get_disk_info)"
+printf 'Free disk: %s\n' "$(get_free_disk)"
+

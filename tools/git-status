@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+project="$(realpath -e -- "${1:?project path required}")"
+[[ -d "$project" ]] || { printf 'Project is not a directory: %s\n' "$project" >&2; exit 64; }
+# Prevent this inspection command from taking optional locks or refreshing the
+# index on disk. Configured filesystem monitors may still be consulted by Git.
+export GIT_OPTIONAL_LOCKS=0
+exec git -C "$project" status --short --branch --untracked-files=all

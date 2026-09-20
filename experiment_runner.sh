@@ -389,8 +389,19 @@ if ((detach && !worker)); then
     sleep 0.05
   done
   [[ -f $job_dir/status.json ]] || error "worker did not initialize; see $job_dir/runner.stderr"
-  printf 'job_id=%s\npid=%d\njob_dir=%s\nstatus=%s\nevents=%s\n' \
-    "$job_id" "$worker_pid" "$job_dir" "$job_dir/status.json" "$job_dir/events.jsonl"
+  if [[ $display_format == jsonl ]]; then
+    command -v jq >/dev/null 2>&1 || error 'jq is required for detached JSON output'
+    jq -cn \
+      --arg job_id "$job_id" \
+      --argjson pid "$worker_pid" \
+      --arg job_dir "$job_dir" \
+      --arg status "$job_dir/status.json" \
+      --arg events "$job_dir/events.jsonl" \
+      '{job_id:$job_id,pid:$pid,job_dir:$job_dir,status:$status,events:$events}'
+  else
+    printf 'job_id=%s\npid=%d\njob_dir=%s\nstatus=%s\nevents=%s\n' \
+      "$job_id" "$worker_pid" "$job_dir" "$job_dir/status.json" "$job_dir/events.jsonl"
+  fi
   exit 0
 fi
 

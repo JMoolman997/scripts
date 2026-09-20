@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+case ${1-} in
+  verify)
+    jq -cn '{
+      name:"mcp_test_launch_failure",
+      description:"Test-only preset whose launch fails predictably.",
+      command:["false"],
+      cwd:null,
+      repeat:1,
+      warmup:0,
+      runtime_limit:null,
+      warnings:[]
+    }'
+    ;;
+  run)
+    printf 'intentional fixture launch failure\n' >&2
+    exit 7
+    ;;
+  *) exit 2 ;;
+esac

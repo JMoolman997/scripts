@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+project="$(realpath -e -- "${1:?project path required}")"
+[[ -d "$project" ]] || { printf 'Project is not a directory: %s\n' "$project" >&2; exit 64; }
+# Disable both external diff commands and text-conversion filters: either may
+# execute repository/user-configured programs during an otherwise read-only diff.
+export GIT_OPTIONAL_LOCKS=0
+exec git -C "$project" diff --no-ext-diff --no-textconv --no-color --

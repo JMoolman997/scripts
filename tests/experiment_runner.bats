@@ -214,3 +214,24 @@ PY
   sleep 2.1
   [ ! -e "$marker" ]
 }
+
+@test "detached JSON format reports machine-readable job paths" {
+  run bash "$runner" --detach --format jsonl -o "$BATS_TEST_TMPDIR/jobs" -- printf 'quoted "output"\nsecond line\n'
+  [ "$status" -eq 0 ]
+  jq -e '
+    type == "object" and
+    (.job_id | type == "string") and
+    (.pid | type == "number") and
+    (.job_dir | type == "string") and
+    (.status | endswith("/status.json")) and
+    (.events | endswith("/events.jsonl"))
+  ' <<<"$output"
+  job_dir="$(jq -r '.job_dir' <<<"$output")"
+  for _ in {1..100}; do
+    state="$(jq -r '.state' "$job_dir/status.json")"
+    [[ $state == done ]] && break
+    sleep 0.05
+  done
+  [ "$state" = done ]
+  [[ "$(cat "$job_dir/stdout/run-000001.log")" == *'quoted "output"'* ]]
+}
