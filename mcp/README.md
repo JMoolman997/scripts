@@ -5,6 +5,44 @@ and jq. It supports the MCP `2025-11-25` initialization lifecycle plus `ping`,
 `tools/list`, and `tools/call`. It opens no network port and has no dependency
 on Ollama or another model provider.
 
+## How the server is organized
+
+`server.sh` is intentionally a single process with no background listener. At
+startup it validates its dependencies and timeout settings, creates a private
+temporary directory, and reserves the original stdout file descriptor for MCP
+responses. Ordinary stdout is redirected to stderr so unexpected diagnostic
+output cannot be mistaken for a protocol message.
+
+The main loop reads one JSON object per line and processes it in these stages:
+
+1. Parse the line and validate the JSON-RPC envelope.
+2. `handle_request` enforces the MCP initialization lifecycle and dispatches the
+   method.
+3. `call_tool` validates each tool's arguments and selects a fixed executable or
+   experiment operation.
+4. `run_command` captures stdout and stderr separately, applies the configured
+   startup/inspection timeout, and creates a consistent structured result.
+5. `tool_response` returns that result as both MCP text content and structured
+   content. Protocol responses are written only to the saved stdout descriptor.
+
+The functions are grouped by purpose in the script:
+
+- **Preset registry:** `preset_wrapper` maps allowlisted names to repository
+  executables, while `available_experiments` supplies their public metadata.
+- **Result helpers:** `send_result`, `send_error`, `validation_failure`, and
+  `run_command` build the JSON-RPC and command-result envelopes.
+- **Experiment validation and launch:** `valid_selection`, `verify_one`,
+  `verify_batch`, and `run_batch` validate presets before starting jobs.
+- **Job access:** `resolve_job` confines a job ID to the state directory,
+  `job_status` reads bounded history, and `cancel_job` verifies the live process
+  identity before signalling it.
+- **Protocol dispatch:** `tool_response`, `call_tool`, and `handle_request`
+  translate validated JSON-RPC methods into the operations above.
+
+The server uses global `PROJECT`, `REPLY`, `STATE_ROOT_REAL`, and `JOB_DIR`
+variables as return values from small validation/resolution helpers. Callers
+must only read those variables after the corresponding function succeeds.
+
 ## Dependencies and Zed configuration
 
 Runtime dependencies are Bash 4+, jq, GNU coreutils, Git, and the tools required
@@ -33,6 +71,17 @@ by an enabled experiment. Merge this into Zed's settings:
 Open **Settings → AI → MCP Servers**, confirm `local-dev-tools` is active, and
 enable it for the Agent profile. Zed's confirmation is the human authorization
 boundary; an MCP argument cannot prove that a human approved an operation.
+
+Two optional environment variables control the bounded foreground work:
+
+- `MCP_INSPECT_TIMEOUT` is the maximum number of seconds for inspection tools
+  and preset verification (default: `15`).
+- `MCP_EXPERIMENT_START_TIMEOUT` is the maximum number of seconds allowed for a
+  wrapper to create and report a detached job (default: `15`). It does **not**
+  limit the detached experiment's runtime.
+
+Both values must be integers from 1 through 9999. `MCP_ENABLE_TEST_PRESETS=1`
+is reserved for the automated test harness and should not be set in normal use.
 
 ## Tools
 
