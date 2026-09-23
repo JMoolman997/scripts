@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 # Minimal MCP 2025-11-25 stdio server for explicit local development tools.
+#
+# Transport is newline-delimited JSON-RPC: one complete request is read from
+# stdin and one complete response is written to the original stdout.  The
+# server deliberately exposes only repository-owned tools and preset wrappers;
+# it never evaluates commands supplied by an MCP client.
 set -uo pipefail
+# Keep fd 3 attached to the protocol stream, then redirect ordinary stdout to
+# stderr.  This prevents a helper's accidental output from corrupting JSON-RPC.
 exec 3>&1
 exec 1>&2
 umask 077
+
+# ---- Startup configuration -------------------------------------------------
 
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 protocol_version=2025-11-25 initialized=0 initialize_succeeded=0
@@ -19,11 +28,17 @@ elif [[ ${HOME-} == /* ]]; then state_base=$HOME/.local/state
 else printf 'HOME or absolute XDG_STATE_HOME is required\n' >&2; exit 1
 fi
 state_root=$state_base/local-dev-tools/experiments
+# Command output is captured here before it is encoded into a tool response.
+# The restrictive umask above protects output that may contain local details.
 work_dir="$(mktemp -d)" || exit 1
 trap 'rm -rf -- "$work_dir"' EXIT HUP INT TERM
 
-# Closed preset mapping. Never accept an executable or wrapper path from MCP.
-# Production intentionally starts empty. The fixed fixture is test-only.
+# ---- Experiment preset registry -------------------------------------------
+
+# Map a public preset name to an audited executable in REPLY.  Keeping this a
+# closed mapping is the main command-injection boundary: never accept an
+# executable or wrapper path from MCP.  Production intentionally starts empty;
+# the fixed entries below are test-only.
 preset_wrapper() {
   case $1 in
     mcp_test_fixture)
@@ -35,6 +50,9 @@ preset_wrapper() {
     *) return 1 ;;
   esac
 }
+
+# Describe the presets visible to the current server instance.  This catalog
+# must be kept in sync with preset_wrapper when a production preset is added.
 available_experiments() {
   if [[ ${MCP_ENABLE_TEST_PRESETS-0} == 1 ]]; then
     jq -cn '{experiments:[
@@ -45,6 +63,9 @@ available_experiments() {
   fi
 }
 
+# Static MCP discovery document.  The annotations tell clients which calls
+# should require confirmation, but validation and allowlisting remain the
+# server's responsibility.
 tools_json="$(jq -cn '{tools:[
  {name:"system_info",description:"Collect read-only OS, CPU, RAM, and root-disk information. This makes no system changes.",inputSchema:{type:"object",properties:{},additionalProperties:false},annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false}},
  {name:"project_info",description:"Inspect a project top level for build markers, Git, compile databases, and test directories. Read-only and non-recursive.",inputSchema:{type:"object",properties:{project:{type:"string",description:"Path to an existing project directory."}},required:["project"],additionalProperties:false},annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false}},
@@ -57,10 +78,18 @@ tools_json="$(jq -cn '{tools:[
  {name:"cancel_experiment",description:"Request termination of one running experiment. Destructive and best-effort; cannot undo prior effects and requires human approval in Zed.",inputSchema:{type:"object",properties:{job_id:{type:"string",pattern:"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"}},required:["job_id"],additionalProperties:false},annotations:{readOnlyHint:false,destructiveHint:true,idempotentHint:false,openWorldHint:false}}
 ]}')" || exit 1
 
+# ---- JSON-RPC and command-result helpers ----------------------------------
+
+# Write protocol messages only to fd 3 (the original stdout).
 send_result() { jq -cn --argjson id "$1" --argjson result "$2" '{jsonrpc:"2.0",id:$id,result:$result}' >&3; }
 send_error() { jq -cn --argjson id "$1" --argjson code "$2" --arg message "$3" '{jsonrpc:"2.0",id:$id,error:{code:$code,message:$message}}' >&3; }
+
+# Return validation errors in the same structured shape as executed commands.
 validation_failure() { jq -cn --arg message "$1" '{success:false,exit_code:null,stdout:"",stderr:$message,timed_out:false}'; }
 
+# Run an argv array with a bounded duration and return, rather than print, all
+# output fields as JSON.  Elapsed time distinguishes timeout's own exit codes
+# from a child process that independently exits with 124 or 137.
 run_command() {
   local seconds=$1 stdout_file=$work_dir/stdout stderr_file=$work_dir/stderr rc timed_out=false start end elapsed
   shift
@@ -71,10 +100,17 @@ run_command() {
   if jq -en --argjson rc "$rc" --argjson elapsed "$elapsed" --argjson limit "$seconds" '($rc==124 or $rc==137) and ($elapsed>=($limit*0.99))' >/dev/null; then timed_out=true; fi
   jq -cn --argjson exit_code "$rc" --argjson timed_out "$timed_out" --rawfile stdout "$stdout_file" --rawfile stderr "$stderr_file" '{success:($exit_code==0),exit_code:$exit_code,stdout:$stdout,stderr:$stderr,timed_out:$timed_out}'
 }
+
+# Resolve an existing project to a canonical directory in the global PROJECT.
 validate_project() { [[ -n $1 ]] && PROJECT="$(realpath -e -- "$1" 2>/dev/null)" && [[ -d $PROJECT ]]; }
+
+# Enforce the experiment-list schema independently of MCP client validation.
 valid_selection() {
   jq -e 'type=="object" and keys==["experiments"] and (.experiments|type=="array" and length>0 and length<=32) and (.experiments|all(type=="string" and test("^[a-z][a-z0-9_-]{0,63}$"))) and ((.experiments|unique|length)==(.experiments|length))' >/dev/null <<<"$1"
 }
+
+# Ask one fixed wrapper to verify its configuration.  A successful wrapper
+# must emit one JSON object whose name agrees with the selected preset.
 verify_one() {
   local name=$1 wrapper result details
   if ! preset_wrapper "$name" || [[ ! -x $REPLY ]]; then validation_failure "unknown or unavailable experiment preset: $name"; return; fi
@@ -85,6 +121,8 @@ verify_one() {
   fi
   jq -cn --arg name "$name" --argjson result "$result" --argjson details "$details" '$result+{experiment:$name,details:$details}'
 }
+
+# Verify every selected preset and aggregate failures without stopping early.
 verify_batch() {
   local arguments=$1 name item items='[]' ok=true
   while IFS= read -r name; do
@@ -93,6 +131,10 @@ verify_batch() {
   done < <(jq -r '.experiments[]' <<<"$arguments")
   jq -cn --argjson success "$ok" --argjson experiments "$items" '{success:$success,exit_code:(if $success then 0 else null end),stdout:"",stderr:(if $success then "" else "One or more presets failed validation." end),timed_out:false,experiments:$experiments}'
 }
+
+# Reverify the complete selection, then ask each wrapper to create a detached
+# job.  Previously started jobs are intentionally retained if a later launch
+# fails, so the response reports both the partial results and started count.
 run_batch() {
   local arguments=$1 verification name wrapper item items='[]' ok=true started=0
   verification="$(verify_batch "$arguments")"; if ! jq -e '.success' >/dev/null <<<"$verification"; then printf '%s\n' "$verification"; return; fi
@@ -110,6 +152,9 @@ run_batch() {
   done < <(jq -r '.experiments[]' <<<"$arguments")
   jq -cn --argjson success "$ok" --argjson started "$started" --argjson experiments "$items" '{success:$success,exit_code:(if $success then 0 else null end),stdout:"",stderr:(if $success then "" else "One or more launches failed; already-started jobs were not rolled back." end),timed_out:false,started:$started,experiments:$experiments,warnings:["Experiments have no forced runtime cap.","Jobs may consume CPU, memory, disk, or other resources until completion or cancellation."]}'
 }
+
+# Resolve a syntactically valid job ID beneath the canonical state root and
+# store the result in JOB_DIR.  The prefix check prevents ../ and symlink escape.
 resolve_job() {
   local candidate
   [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ && -d $state_root ]] || return 1
@@ -118,6 +163,8 @@ resolve_job() {
   [[ $candidate == "$STATE_ROOT_REAL"/* && -d $candidate ]] || return 1
   JOB_DIR=$candidate
 }
+
+# Return bounded job history (the newest 100 records) plus paths to full logs.
 job_status() {
   local id=$1 metadata status events results
   if ! resolve_job "$id" || [[ ! -f $JOB_DIR/metadata.json || ! -f $JOB_DIR/status.json ]]; then validation_failure "unknown experiment job: $id"; return; fi
@@ -127,6 +174,10 @@ job_status() {
   results="$(jq -sc '.[-100:]' "$JOB_DIR/results.jsonl" 2>/dev/null)" || { validation_failure "invalid results for experiment job: $id"; return; }
   jq -cn --arg id "$id" --arg dir "$JOB_DIR" --argjson metadata "$metadata" --argjson status "$status" --argjson events "$events" --argjson results "$results" '{success:true,exit_code:0,stdout:"",stderr:"",timed_out:false,job_id:$id,job_dir:$dir,metadata:$metadata,status:$status,recent_events:$events,recent_results:$results,output:{stdout_dir:($dir+"/stdout"),stderr_dir:($dir+"/stderr")},truncated:{events:($events|length==100),results:($results|length==100)}}'
 }
+
+# Request best-effort cancellation only after /proc confirms the recorded PID
+# is this repository's runner and is working on the resolved job directory.
+# This narrows PID-reuse races and avoids signalling an unrelated process.
 cancel_job() {
   local id=$1 status pid index worker_matches=false script_matches=false
   local -a argv=()
@@ -145,7 +196,15 @@ cancel_job() {
   jq -cn --arg id "$id" --argjson pid "$pid" '{success:true,exit_code:0,stdout:"",stderr:"",timed_out:false,job_id:$id,runner_pid:$pid,cancellation_requested:true,warnings:["Cancellation is best-effort.","Effects already produced cannot be undone."]}'
 }
 
+# ---- MCP dispatch ----------------------------------------------------------
+
+# MCP tool results contain both a human-readable text block and the same data
+# as structuredContent.  Failed operations are transport successes with
+# isError=true, as required for a tools/call result.
 tool_response() { local p; p="$(jq -cn --argjson data "$2" '{content:[{type:"text",text:($data|tojson)}],structuredContent:$data,isError:($data.success|not)}')"; send_result "$1" "$p"; }
+
+# Validate arguments again at the trust boundary, dispatch a fixed tool, and
+# normalize its result before returning it to the client.
 call_tool() {
   local id=$1 request=$2 name arguments project result job_id
   name="$(jq -r '.params.name' <<<"$request")"; arguments="$(jq -c '.params.arguments//{}' <<<"$request")"
@@ -166,6 +225,10 @@ call_tool() {
   esac
   tool_response "$id" "$result"
 }
+
+# Implement the MCP lifecycle and route an already parsed JSON-RPC request.
+# Tool discovery and execution remain locked until initialize succeeds and the
+# client follows it with notifications/initialized.
 handle_request() {
   local request=$1 id method result
   id="$(jq -c '.id//null' <<<"$request")"; method="$(jq -r '.method//empty' <<<"$request")"
@@ -186,6 +249,9 @@ handle_request() {
     *) [[ $id == null ]] || send_error "$id" -32601 "Method not found: $method" ;;
   esac
 }
+
+# Each input line is one JSON-RPC message.  Parse and envelope validation happen
+# before dispatch so malformed requests cannot reach the tool-specific logic.
 while IFS= read -r line || [[ -n $line ]]; do
   if ! request="$(jq -ce 'if type=="object" then . else error("not an object") end' <<<"$line" 2>/dev/null)"; then send_error null -32700 'Parse error'; continue; fi
   if ! jq -e '.jsonrpc=="2.0" and (.method|type=="string") and (.method|index("\u0000")==null) and ((has("id")|not) or (.id|type=="string" or type=="number"))' >/dev/null <<<"$request"; then id="$(jq -c 'if (.id|type=="string" or type=="number") then .id else null end' <<<"$request")"; send_error "$id" -32600 'Invalid Request'; continue; fi
